@@ -1,0 +1,15 @@
+TOOLCHAIN =
+CXX = $(TOOLCHAIN)g++
+AR = $(TOOLCHAIN)ar
+
+PYTHON3 = /usr/bin/env python3
+
+INCLUDES = -I$(PROJECT_ROOT)/include
+
+DEFINES =
+
+EXTRA_FLAGS = -Werror
+
+BUILD_MODE = debug
+
+BINARY_ROOT = $(PROJECT_ROOT)/out/$(BUILD_MODE)

@@ -4,14 +4,17 @@
 #include <stdint.h>
 #include <cstring>
 #include <cherry/unpack/Unpacker.hpp>
-#include <cherry/thread/Mutex.hpp>
+#include <cherry/wrapper/wrapper.hpp>
 
 namespace cherry {
 
 class IvfUnpacker : public Unpacker {
 public:
 	IvfUnpacker(const char* filename);
-	virtual ~IvfUnpacker();
+
+	virtual ~IvfUnpacker() {
+		wrapper::munmap_(memory, getMapSize());
+	}
 
 	virtual const void* getCompressedFrame(int* size);
 
@@ -45,10 +48,15 @@ private:
 	};
 
 	unsigned char* memory;
-	uint64_t mapSize;
 	uint64_t fileSize;
 	uint64_t offset;
-	Mutex mutex;
+
+	void mapIvfFile(const char* filename);
+
+	uint64_t getMapSize() {
+		long pageSize = sysconf(_SC_PAGE_SIZE);
+		return (fileSize + pageSize - 1) / pageSize * pageSize;
+	}
 };
 
 } // namespace cherry
