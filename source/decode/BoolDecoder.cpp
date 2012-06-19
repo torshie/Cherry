@@ -1,30 +1,25 @@
 #include <cherry/decode/BoolDecoder.hpp>
+#include <cherry/except/FeatureIncomplete.hpp>
+#include <cherry/wrapper/wrapper.hpp>
 
 using namespace cherry;
 
-BoolDecoder::BoolDecoder(const void* input, size_t size, uint8_t probability)
-		: shift(0), length(255), probability(probability) {
-	stream.buffer = static_cast<const unsigned char*>(input);
-	stream.size = size;
-	if (size >= 2) {
-		stream.cursor = stream.buffer + 2;
-		value = (uint32_t)stream.buffer[0] * 256 + stream.buffer[1];
-	} else if (size == 0) {
-		RAISE(InvalidArgument, "Parameter *size* must be positive");
-	} else {
-		stream.cursor = stream.buffer + 1;
-		value = stream.buffer[0];
+BoolDecoder::BoolDecoder(const void* input, size_t size)
+		: shift(0), length(255), buffer((const uint8_t*)input),
+		cursor(buffer + 2), size(size) {
+	if (size <= 2) {
+		RAISE(FeatureIncomplete, "String fed to BoolDecoder is too short");
 	}
+	value = ((uint32_t)buffer[0] << 8) + buffer[1];
 }
 
-bool BoolDecoder::getBool() {
+bool BoolDecoder::decode(Probability probability) {
 	uint32_t split = 1 + (length - 1) * probability / 256;
-	uint32_t valueSplit = split * 256;
 	bool result = false;
-	if (value >= valueSplit) {
+	if (value >= split * 256) {
 		result = true;
 		length -= split;
-		value -= valueSplit;
+		value -= split * 256;
 	} else {
 		length = split;
 	}
@@ -35,12 +30,32 @@ bool BoolDecoder::getBool() {
 		++shift;
 		if (shift == 8) {
 			shift = 0;
-			if (stream.cursor - stream.buffer < (ptrdiff_t)stream.size) {
-				value |= *stream.cursor;
-				++stream.cursor;
+			if (cursor - buffer < (ptrdiff_t)size) {
+				value |= *cursor;
+				++cursor;
 			}
 		}
 	}
 
+#if 0
+	static int sequence = 0;
+	static FILE* file = NULL;
+	++sequence;
+	if (file == NULL) {
+		file = wrapper::fopen_("/home/witch/cherry-log.log", "w");
+	}
+	std::fprintf(file, "%d %d %d\n", result, probability, sequence);
+	wrapper::fflush_(file);
+#endif
+
 	return result;
+}
+
+int8_t BoolDecoder::decode(const TreeIndex* tree,
+		const Probability* table) {
+	TreeIndex index = 0;
+	while ((index = tree[index + decode(table[index / 2])]) > 0) {
+		// Empty
+	}
+	return -index;
 }

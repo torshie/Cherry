@@ -6,6 +6,9 @@ SOURCE = decode/BoolDecoder.cpp \
 	encode/BoolEncoder.cpp \
 	except/BasicExcept.cpp \
 	unpack/IvfUnpacker.cpp \
+	vp8/DecoderDriver.cpp \
+	vp8/FrameBuffer.cpp \
+	dsp/dsp.cpp \
 	$(GENERATED)
 
 -include $(call INCLUDE_PATH, $(SOURCE))

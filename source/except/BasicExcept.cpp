@@ -11,7 +11,8 @@ BasicExcept::BasicExcept(const char* origin) {
 		--start;
 	}
 	++start;
-	snprintf(message, sizeof(message), "%s, %s", start, typeid(*this).name());
+	snprintf(message, sizeof(message), "%s, %s", start,
+			typeid(*this).name());
 }
 
 void BasicExcept::buildMessageBuffer(const char* format, va_list ap) {

@@ -7,11 +7,19 @@ else
     CXXFLAGS += -O0 -g
 endif
 
-ifneq ($(or $(findstring g++,$(CXX)), $(findstring gcc,$(CXX))),)
-    CXXFLAGS += -flto
+ifneq ($(BUILD_MODE),debug)
+    ifneq ($(or $(findstring g++,$(CXX)), $(findstring gcc,$(CXX))),)
+        CXXFLAGS += -flto
+    endif
+    ifneq ($(findstring clang,$(CXX)),)
+        CXXFLAGS += -flto
+    endif
 endif
-ifneq ($(findstring clang,$(CXX)),)
-    CXXFLAGS += -flto
+
+ifeq ($(TRAP_INTEGER_OVERFLOW),yes)
+    ifeq ($(BUILD_MODE),debug)
+        CXXFLAGS += -ftrapv
+    endif
 endif
 
 RELATIVE_PATH = $(subst $(PROJECT_ROOT),,$(CURDIR))

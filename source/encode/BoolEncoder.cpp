@@ -6,9 +6,8 @@ void BoolEncoder::flush() {
 	if (shift == 0) {
 		return;
 	}
-	probability = 128;
 	for (int i = 0; i < 32; ++i) {
-		addBool(false);
+		addBool(false, 128);
 	}
 	shift = 0;
 }

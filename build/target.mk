@@ -4,10 +4,10 @@ $(BINARY_ROOT)/%.o: $(PROJECT_ROOT)/%.cpp
 
 $(BINARY_ROOT)/%.dep: $(PROJECT_ROOT)/%.cpp
 	@[ -d $(@D) ] || mkdir -p $(@D)
-	$(CXX) -MM -MT $(patsubst %.dep,%.o,$@) $< $(CXXFLAGS) > $@
+	$(CXX) -M -MT $(patsubst %.dep,%.o,$@) $< $(CXXFLAGS) > $@
 
 %.dep: %.cpp
-	$(CXX) -MM -MT $(patsubst %.dep,%.o,$@) $< $(CXXFLAGS) > $@
+	$(CXX) -M -MT $(patsubst %.dep,%.o,$@) $< $(CXXFLAGS) > $@
 
 build-required: $(addsuffix -build_submake_phony,$(REQUIRE))
 
@@ -20,7 +20,7 @@ $(BINARY_DIRECTORY)/%.cpp: %.py
 
 clean:
 	@echo '************************************************************'
-	@echo '* Command "make clean" is not implemented.'
-	@echo '* Use the following command to remove the entire build tree:'
-	@echo '*   rm -rf $(BINARY_ROOT)'
+	@echo '  Command "make clean" is not implemented.'
+	@echo '  Use the following command to remove the entire build tree:'
+	@echo '    rm -rf $(BINARY_ROOT)'
 	@echo '************************************************************'

@@ -1,12 +1,12 @@
 REQUIRE = ../source
 include ../build/include.mk
 
-SOURCE = bool-codec.cpp
+SOURCE = unpack-ivf.cpp decode-first.cpp bool-decoder.cpp
 -include $(call INCLUDE_PATH, $(SOURCE))
 
-EXE = bool-codec.exe
+EXE = $(patsubst %.cpp,%,$(SOURCE))
 
 build: build-required $(addprefix $(BINARY_DIRECTORY)/,$(EXE))
 
-%.exe: %.o $(BINARY_ROOT)/source/libcherry.a
+%: %.o $(BINARY_ROOT)/source/libcherry.a
 	$(CXX) -o $@ -Wl,--start-group $^ -Wl,--end-group $(CXXFLAGS)

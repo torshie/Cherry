@@ -10,7 +10,10 @@ public:
 	virtual ~Unpacker() {}
 
 	virtual int getCompressedFrame(void* buffer, int size) = 0;
-	virtual const void* getCompressedFrame(int* /* size */) { return NULL; }
+
+	virtual const void* getCompressedFrame(int* /* size */) {
+		return NULL;
+	}
 };
 
 } // namespace cherry

@@ -85,8 +85,7 @@ inline void mkfifo_(const char* path, mode_t mode) {
 }
 
 inline void bind_(int sockfd, const void *addr, socklen_t addrlen) {
-	CHECK_RETURN_ZERO(bind(sockfd, static_cast<const struct sockaddr*>(addr),
-			addrlen));
+	CHECK_RETURN_ZERO(bind(sockfd, (const struct sockaddr*)addr, addrlen));
 }
 
 inline void listen_(int sockfd, int backlog) {
@@ -98,8 +97,8 @@ inline int accept_(int sock, struct sockaddr* addr, socklen_t* len) {
 }
 
 inline void connect_(int sockfd, const void *addr, socklen_t addrlen) {
-	CHECK_RETURN_ZERO(connect(sockfd,
-			static_cast<const struct sockaddr*>(addr), addrlen));
+	CHECK_RETURN_ZERO(connect(sockfd, (const struct sockaddr*)addr,
+			addrlen));
 }
 
 inline pid_t fork_() {
@@ -142,8 +141,8 @@ inline int dup_(int old) {
 	CHECK_NON_NEGATIVE(int, dup(old));
 }
 
-inline void setsockopt_(int sockfd, int level, int optname, const void* val,
-		socklen_t len) {
+inline void setsockopt_(int sockfd, int level, int optname,
+		const void* val, socklen_t len) {
 	CHECK_RETURN_ZERO(setsockopt(sockfd, level, optname, val, len));
 }
 

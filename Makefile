@@ -1,4 +1,4 @@
-REQUIRE = source sample
+REQUIRE = source sample tools
 
 include build/include.mk
 

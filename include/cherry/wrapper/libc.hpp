@@ -17,7 +17,7 @@ inline void fclose_(FILE* file) {
 inline FILE* fopen_(const char* name, const char* mode) {
 	FILE* file = std::fopen(name, mode);
 	if (file == NULL) {
-		RAISE(SystemError, errno);
+		RAISE(SystemError, errno, "%s", name);
 	}
 	return file;
 }
