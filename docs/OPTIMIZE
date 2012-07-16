@@ -1,0 +1,22 @@
+* Cache the intermediate result when searching the "context" for the Y2 plane
+  that is the number of neighbor Y2 blocks containing at least one non-zero
+  coefficient.
+* Expand all loops for decoding tree-coded data manually. 
+* Decode all coefficients of a macroblock before predicting, which may improve
+  cache performance.
+* Use 32-bit or 64-bit intergers instead of 8-bit integers when predicting, 
+  dequantizing and transforming if SIMD instructions are unavailable.
+* Replate function clamp() with some inlined assembly function.
+* Optimize IWHT and IDCT if there is no coefficient or only one coefficient.
+* Cache frame and macroblock level quantizers.
+* Store the transformed residuals inside a macroblock pixel by pixel instead
+  of subblock by subblock in raster scan order. By storing residuals in this
+  order it would be easier to sum the predicted pixels and the residuals.
+* Spaw different threads to decode metadata, decode residuals and apply loop
+  filters.
+
+** Is it faster to store intermediate frames pixel by pixel or macroblock by
+   macroblock. And how about reference frames? This is all about main memory
+   and cache performance under complex situations, thus very difficult to
+   estimate.
+
