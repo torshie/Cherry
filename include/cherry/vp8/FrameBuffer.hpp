@@ -1,24 +1,35 @@
 #ifndef _CHERRY_VP8_FRAME_BUFFER_HPP_INCLUDED_
 #define _CHERRY_VP8_FRAME_BUFFER_HPP_INCLUDED_
 
-#include <cherry/vp8/types.hpp>
+#include <cstddef>
+#include <cherry/vp8/BlockInfo.hpp>
+#include <cherry/utility/memory.hpp>
 
 namespace cherry {
 
 struct FrameBuffer {
-	typedef Pixel Luma[16 * 16];
-	typedef Pixel Chroma[8 * 8];
+	friend class DecoderDriver;
 
-	FrameBuffer(int width, int height);
+	BlockInfo* info;
+	Pixel* luma;
+	Pixel* chroma[2];
 
-	~FrameBuffer() {
-		delete[] luma;
-		delete[] chroma[0];
-		delete[] chroma[1];
+	FrameBuffer() : info(NULL), luma(NULL) {
+		chroma[0] = chroma[1] = NULL;
 	}
 
-	Luma* luma;
-	Chroma* chroma[2];
+	~FrameBuffer() {
+		destroy();
+	}
+
+	void destroy() {
+		release<16>(luma);
+		release<8>(chroma[0]);
+		release<8>(chroma[1]);
+		delete[] info;
+	}
+
+	void create(int width, int height);
 };
 
 } // namespace cherry

@@ -1,57 +1,61 @@
 #include <cstdlib>
 #include <cherry/utility/misc.hpp>
+#include <cherry/utility/memory.hpp>
 #include <cherry/vp8/DecoderDriver.hpp>
-#include <cherry/except/InvalidBoolString.hpp>
+#include <cherry/vp8/const.hpp>
+#include <cherry/except/InvalidInputStream.hpp>
 #include <cherry/except/Unpossible.hpp>
 #include <cherry/except/FeatureIncomplete.hpp>
 #include <cherry/dsp/dsp.hpp>
 
 using namespace cherry;
 
+
+DecoderDriver::DecoderDriver() : frameData(NULL), frameSize(0) {
+	const static Probability
+	kDefaultCoeff[4][8][3][kCoeffTokenCount - 1] = {
+#include <table/probability/defaultCoefficient.i>
+	};
+	std::memset(&context, 0, sizeof(context));
+	std::memset(&geometry, 0, sizeof(geometry));
+	std::memcpy(&context.coeff, &kDefaultCoeff, sizeof(kDefaultCoeff));
+	for (size_t i = 0; i < ELEMENT_COUNT(context.quantizer.index); ++i) {
+		context.quantizer.index[i] = -1;
+	}
+}
+
 void DecoderDriver::decodeFrame() {
 	decodeFrameHeader();
 
-	for (int i = 0; i < context.vertical.blockCount; ++i) {
-		for (int j = 0; j < context.horizon.blockCount; ++j) {
-			int tmp = (context.horizon.blockCount + 1) * (i + 1) + j + 1;
-			decodeBlockHeader(context.block[kCurrentFrame] + tmp);
+	for (int i = 1; i < geometry.blockHeight; ++i) {
+		for (int j = 1; j < geometry.blockWidth; ++j) {
+			int tmp = geometry.blockWidth * i + j;
+			decodeBlockHeader(buffer.current.info + tmp);
 		}
 	}
 
-	delete source;
 	int tagSize = context.keyFrame ? 10 : 3;
-	source = new BoolDecoder(
-			(char*)frameData + context.firstPartSize + tagSize,
+	source.reload((char*)frameData + context.firstPartSize + tagSize,
 			frameSize - context.firstPartSize - tagSize);
 
-	for (int i = 0; i < context.vertical.blockCount; ++i) {
-		for (int j = 0; j < context.horizon.blockCount; ++j) {
-			int tmp = (context.horizon.blockCount + 1) * (i + 1) + j + 1;
-			buildMacroblock(tmp);
+	for (int i = 1; i < geometry.blockHeight; ++i) {
+		for (int j = 1; j < geometry.blockWidth; ++j) {
+			decodeMacroblock(i, j);
 		}
 	}
+
+	// TODO apply loop filters
 
 	writeDisplayBuffer();
 }
 
 void DecoderDriver::setFrameData(const void* data, size_t size) {
-	delete source;
 	frameData = data;
 	frameSize = size;
 
 	decodeFrameTag(data);
 	int tagSize = context.keyFrame ? 10 : 3;
-	source = new BoolDecoder((const char*)data + tagSize, size - tagSize);
-}
-
-int8_t DecoderDriver::getDummySubmode(int8_t intraMode) {
-	switch (intraMode) {
-	case kAverageMode: return kAverageSubmode;
-	case kVerticalMode: return kVerticalSubmode;
-	case kHorizontalMode: return kHorizontalSubmode;
-	case kTrueMotionMode: return kTrueMotionSubmode;
-	default: RAISE(Unpossible);
-	}
+	source.reload((const char*)data + tagSize, size - tagSize);
 }
 
 Pixel DecoderDriver::clamp(int value) {
@@ -64,12 +68,546 @@ Pixel DecoderDriver::clamp(int value) {
 	}
 }
 
-void DecoderDriver::predictSingleSubblock(Pixel b[4][4],
-		Pixel* above, Pixel* left, Pixel corner, Pixel* extra,
-		int8_t submode) {
+void DecoderDriver::decodeFrameHeader() {
+	if (context.keyFrame) {
+		if (source.uint<1>() != 0) {
+			RAISE(InvalidInputStream, "Color space other than YUV isn't "
+					"supported.");
+		}
+		context.disableClamping = source.uint<1>();
+	}
+	updateSegmentation();
+	updateLoopFilter();
+	context.log2PartitionCount = source.uint<2>();
+	if (context.log2PartitionCount != 0) {
+		RAISE(FeatureIncomplete, "Partitioning isn't supported");
+	}
+	decodeQuantizerTable();
+	if (context.keyFrame) {
+		context.refreshProbability = source.uint<1>();
+	} else {
+		// TODO: Complete this branch
+	}
+	updateCoeffProbability();
+	context.skipping.enabled = source.uint<1>();
+	if (context.skipping.enabled) {
+		context.skipping.probability = source.uint<8>();
+	}
+	if (!context.keyFrame) {
+		// TODO: Complete this branch
+	}
+}
+
+void DecoderDriver::decodeBlockHeader(BlockInfo* info) {
+	if (context.segment.enabled && context.segment.updateMapping) {
+		info->segment = source.decodeSegmentId(
+				context.segment.probability);
+	}
+	if (context.skipping.enabled) {
+		info->skipCoeff = source.decode(context.skipping.probability);
+	}
+	// TODO: Handle inter frames.
+	info->lumaMode = source.decodeLumaMode();
+	if (info->lumaMode == kDummyLumaMode) {
+		decodeSubmode(info);
+	} else {
+		info->setDummySubmode();
+	}
+	info->chromaMode = source.decodeChromaMode();
+}
+
+void DecoderDriver::decodeSubmode(BlockInfo* info) {
+	const static Probability
+	probability[kSubmodeCount][kSubmodeCount][kSubmodeCount - 1] = {
+#include <table/probability/keyFrame/submode.i>
+	};
+
+	BlockInfo* blockAbove = info - geometry.blockWidth;
+	int8_t* above = blockAbove->submode;
+	int8_t* left = (info - 1)->submode;
+	int8_t* dest = info->submode;
+	dest[0] = source.decodeSubblockMode(probability[above[12]][left[3]]);
+	for (int i = 1; i < 4; ++i) {
+		dest[i] = source.decodeSubblockMode(
+				probability[above[12 + i]][dest[i - 1]]);
+	}
+	for (int i = 4; i < 16; ++i) {
+		if (i % 4 == 0) {
+			dest[i] = source.decodeSubblockMode(
+					probability[dest[i - 4]][left[i + 3]]);
+		} else {
+			dest[i] = source.decodeSubblockMode(
+					probability[dest[i - 4]][dest[i - 1]]);
+		}
+	}
+}
+
+short DecoderDriver::decodeTokenOffset(int category) {
+	const static Probability kOffsetProbability[][12] = {
+		{ 159, 0},
+		{ 165, 145, 0},
+		{ 173, 148, 140, 0},
+		{ 176, 155, 140, 135, 0},
+		{ 180, 157, 141, 134, 130, 0},
+		{ 254, 254, 243, 230, 196, 177, 153, 140, 133, 130, 129, 0}
+	};
+	int_fast16_t offset = 0;
+	for (const Probability* p = kOffsetProbability[category]; *p != 0;
+			++p) {
+		offset += offset + source.decode(*p);
+	}
+	return offset;
+}
+
+void DecoderDriver::decodeFrameTag(const void* data) {
+	const uint8_t* cursor = (const uint8_t*)data;
+	uint32_t raw = cursor[0] | ((uint32_t)cursor[1] << 8)
+			| ((uint32_t)cursor[2] << 16);
+	cursor += 3;
+	context.keyFrame = !(raw & 1);
+	context.version = (raw >> 1) & 7;
+	context.invisible = !((raw >> 4) & 1);
+	context.firstPartSize = (raw >> 5) & 0x7ffff;
+	if (context.keyFrame) {
+		if (cursor[0] != 0x9d || cursor[1] != 0x01 || cursor[2] != 0x2a) {
+			RAISE(InvalidInputStream,
+					"Cannot find start code in key frame.");
+		}
+		cursor += 3;
+		uint16_t tmp = cursor[0] | ((uint16_t)cursor[1] << 8);
+		cursor += 2;
+		int width = tmp & 0x3fff;
+		tmp = cursor[0] | ((uint16_t)cursor[1] << 8);
+		int height = tmp & 0x3fff;
+		if (width != geometry.displayWidth
+				|| height != geometry.displayHeight) {
+			resizeFrame(width, height);
+		}
+	}
+}
+
+void DecoderDriver::addSubblockResidual(int row, int column, Pixel* target,
+		const short* residual, Pixel subblock[4][4]) {
+	for (int i = 0; i < 4; ++i) {
+		int offset = (row * 4 + i) * geometry.lumaWidth + column * 4;
+		for (int j = 0; j < 4; ++j) {
+			target[offset + j] =
+					clamp(subblock[i][j] + residual[i * 4 + j]);
+		}
+	}
+}
+
+//  Coefficient token tree:
+//   +--(0)---+
+//   |        |
+// (End)  +--(1)---+
+//        |        |
+//        0  +----(2)------+                       +-- This subtree is
+//           |             |                       |   decoded by method
+//           1   +--------(3)---------------+  <<--+   decodeLargeCoeff()
+//               |                          |
+//     +--------(4)---+             +------(6)-------+
+//     |              |             |                |
+//     2       +-----(5)--+     +--(7)--+     +-----(8)------+
+//             |          |     |       |     |              |
+//             3          4    5~6     7~10   |              |
+//                                      +----(9)--+     +---(10)--+
+//                                      |         |     |         |
+//                                   11~18     19~34  35~66    67~2048
+int DecoderDriver::decodeCoeffArray(short* coefficient, bool acOnly,
+		PlaneType plane, int ctx) {
+	const static int kZigZag[] = {
+		0,  1,  4,  8,  5,  2,  3,  6,  9, 12, 13, 10,  7, 11, 14, 15
+	};
+	const static int kCoeffBand[] = {
+		0, 1, 2, 3, 6, 4, 5, 6, 6, 6, 6, 6, 6, 6, 6, 7, 0
+	};
+
+	coefficient[0] = 0;
+	int index = acOnly ? 1 : 0;
+	Probability* probability = context.coeff[plane][index][ctx];
+	if (!source.decode(probability[0])) {
+		return 0;
+	}
+	for (; index < 16; ++index) {
+		if (!source.decode(probability[1])) {
+			probability = context.coeff[plane][kCoeffBand[index + 1]][0];
+			continue;
+		}
+		int value;
+		if (!source.decode(probability[2])) {
+			probability = context.coeff[plane][kCoeffBand[index + 1]][1];
+			value = 1;
+		} else {
+			if (!source.decode(probability[3])) {
+				if (!source.decode(probability[4])) {
+					value = 2;
+				} else {
+					if (!source.decode(probability[5])) {
+						value = 3;
+					} else {
+						value = 4;
+					}
+				}
+			} else {
+				value = decodeLargeCoeff(probability);
+			}
+			probability = context.coeff[plane][kCoeffBand[index + 1]][2];
+		}
+		coefficient[kZigZag[index]] = source.uint<1>() ? -value : value;
+		if (index == 15 || !source.decode(probability[0])) {
+			++index;
+			break;
+		}
+	}
+	dequantizeCoefficient(coefficient, plane, index);
+	return index;
+}
+
+int DecoderDriver::decodeLargeCoeff(const Probability* probability) {
+	if (!source.decode(probability[6])) {
+		if (!source.decode(probability[7])) {
+			return 5 + decodeTokenOffset(0);
+		} else {
+			return 7 + decodeTokenOffset(1);
+		}
+	} else {
+		if (!source.decode(probability[8])) {
+			if (!source.decode(probability[9])) {
+				return 11 + decodeTokenOffset(2);
+			} else {
+				return 19 + decodeTokenOffset(3);
+			}
+		} else {
+			if (!source.decode(probability[10])) {
+				return 35 + decodeTokenOffset(4);
+			} else {
+				return 67 + decodeTokenOffset(5);
+			}
+		}
+	}
+}
+
+void DecoderDriver::decodeBlockCoeff(short coefficient[25][16],
+		BlockInfo* info, int row, int column) {
+	std::memset(coefficient, 0, 25 * 16 * sizeof(short));
+	if (context.skipping.enabled && info->skipCoeff) {
+		std::memset(context.hasCoeff.above[column], 0, sizeof(bool) * 8);
+		std::memset(context.hasCoeff.left[row], 0, sizeof(bool) * 8);
+		if (info->hasVirtualPlane()) {
+			context.hasCoeff.above[column][8] = false;
+			context.hasCoeff.left[row][8] = false;
+		}
+		return;
+	}
+	bool acOnly = false;
+	PlaneType lumaType = kFullLumaPlane;
+	if (info->hasVirtualPlane()) {
+		int ctx = context.hasCoeff.above[column][8]
+				+ context.hasCoeff.left[row][8];
+		info->lastCoeff[24] = decodeCoeffArray(coefficient[24], false,
+				kVirtualPlane, ctx);
+		context.hasCoeff.above[column][8] =
+				context.hasCoeff.left[row][8] =
+						(info->lastCoeff[24] > 0);
+		acOnly = true;
+		lumaType = kPartialLumaPlane;
+	}
+	for (int i = 0; i < 4; ++i) {
+		for (int j = 0; j < 4; ++j) {
+			int ctx = context.hasCoeff.above[column][j]
+					+ context.hasCoeff.left[row][i];
+			int id = i * 4 + j;
+			info->lastCoeff[id] = decodeCoeffArray(coefficient[id],
+					acOnly, lumaType, ctx);
+			context.hasCoeff.above[column][j] =
+					context.hasCoeff.left[row][i] =
+							(info->lastCoeff[id] > 0);
+		}
+	}
+	for (int p = 0; p < 2; ++p) {
+		for (int i = 0; i < 2; ++i) {
+			for (int j = 0; j < 2; ++j) {
+				int ctx = context.hasCoeff.above[column][4 + p * 2 + j]
+						+ context.hasCoeff.left[row][4 + p * 2 + i];
+				int id = 16 + 4 * p + 2 * i + j;
+				info->lastCoeff[id] = decodeCoeffArray(coefficient[id],
+						false, kChromaPlane, ctx);
+				context.hasCoeff.above[column][4 + p * 2 + j] =
+						context.hasCoeff.left[row][4 + p * 2 + i] =
+								(info->lastCoeff[id] > 0);
+			}
+		}
+	}
+}
+
+void DecoderDriver::updateLoopFilter() {
+	context.filter.type = source.uint<1>();
+	context.filter.level = source.uint<6>();
+	context.filter.sharpness = source.uint<3>();
+	context.filter.delta.enabled = source.uint<1>();
+	if (context.filter.delta.enabled && source.uint<1>()) {
+		for (int i = 0; i < 4; ++i) {
+			if (source.uint<1>()) {
+				context.filter.delta.reference[i] = source.sint<7>();
+			}
+		}
+		for (int i = 0; i < 4; ++i) {
+			if (source.uint<1>()) {
+				context.filter.delta.mode[i] = source.sint<7>();
+			}
+		}
+	}
+}
+
+void DecoderDriver::updateSegmentation() {
+	context.segment.enabled = source.uint<1>();
+	if (!context.segment.enabled) {
+		return;
+	}
+	RAISE(FeatureIncomplete, "Segmentation isn't supported");
+	context.segment.updateMapping = source.uint<1>();
+	bool updateFeature = source.uint<1>();
+	if (updateFeature) {
+		bool absoluteValue = source.uint<1>();
+		for (int i = 0; i < 4; ++i) {
+			int8_t value = 0;
+			if (source.uint<1>()) {
+				value = source.sint<8>();
+			}
+			if (absoluteValue) {
+				context.segment.quantizer[i] = value;
+			} else {
+				context.segment.quantizer[i] += value;
+			}
+		}
+		for (int i = 0; i < 4; ++i) {
+			int8_t value = 0;
+			if (source.uint<1>()) {
+				value = source.sint<7>();
+			}
+			if (absoluteValue) {
+				context.segment.loopFilter[i] = value;
+			} else {
+				context.segment.loopFilter[i] += value;
+			}
+		}
+	}
+	if (context.segment.updateMapping) {
+		for (size_t i = 0; i < ELEMENT_COUNT(context.segment.probability);
+				++i) {
+			Probability probability = 255;
+			if (source.uint<1>()) {
+				probability = source.uint<8>();
+			}
+			context.segment.probability[i] = probability;
+		}
+	}
+}
+
+void DecoderDriver::decodeQuantizerTable() {
+	bool update = false;
+	int v = source.uint<7>();
+	if (context.quantizer.index[0] != v) {
+		context.quantizer.index[0] = v;
+		update = true;
+	}
+	for (int i = 1; i < kQuantizerCount; ++i) {
+		v = context.quantizer.index[0];
+		if (source.uint<1>()) {
+			v += source.sint<5>();
+			if (v < 0) {
+				v = 0;
+			} else if (v > 127) {
+				v = 127;
+			}
+		}
+		if (context.quantizer.index[i] != v) {
+			context.quantizer.index[i] = v;
+			update = true;
+		}
+	}
+
+	if (update) {
+		updateQuantizerValue();
+	}
+}
+
+void DecoderDriver::updateQuantizerValue() {
+	static const short kDcQuantizer[] = {
+#include <table/quantizer/dc.i>
+	};
+
+	int* index = context.quantizer.index;
+	short (*value)[2] = context.quantizer.value;
+	value[kLumaDc / 2][0] = kDcQuantizer[index[kLumaDc]];
+	value[kVirtualDc / 2][0] = kDcQuantizer[index[kVirtualDc]] * 2;
+	short factor = kDcQuantizer[index[kChromaDc]];
+	value[kChromaDc / 2][0] = (factor > 132) ? 132 : factor;
+
+	static const short kAcQuantizer[] = {
+#include <table/quantizer/ac.i>
+	};
+	value[kLumaAc / 2][1] = kAcQuantizer[index[kLumaAc]];
+	factor = kAcQuantizer[index[kVirtualAc]] * 155 / 100;
+	if (factor < 8) {
+		factor = 8;
+	}
+	value[kVirtualAc / 2][1] = factor;
+	value[kChromaAc / 2][1] = kAcQuantizer[index[kChromaAc]];
+}
+
+void DecoderDriver::updateCoeffProbability() {
+	const static Probability
+	kProbability[4][8][3][kCoeffTokenCount - 1] = {
+#include <table/probability/updateCoefficient.i>
+	};
+	for (int i = 0; i < 4; ++i) {
+		for (int j = 0; j < 8; ++j) {
+			for (int k = 0; k < 3; ++k) {
+				for (int l = 0; l < kCoeffTokenCount - 1; ++l) {
+					if (source.decode(kProbability[i][j][k][l])) {
+						context.coeff[i][j][k][l] = source.uint<8>();
+					}
+				}
+			}
+		}
+	}
+}
+
+void DecoderDriver::update16x16Probability() {
+	if (source.uint<1>()) {
+		for (int i = 0; i < 4; ++i) {
+			source.uint<8>();
+		}
+	}
+}
+
+void DecoderDriver::updateChromaProbability() {
+	if (source.uint<1>()) {
+		for (int i = 0; i < 3; ++i) {
+			source.uint<8>();
+		}
+	}
+}
+
+void DecoderDriver::updateMotionVectorProbability() {
+	for (int i = 0; i < 2 * 19; ++i) {
+		if (source.uint<1>()) {
+			source.uint<7>();
+		}
+	}
+}
+
+void DecoderDriver::resizeFrame(int width, int height) {
+	geometry.displayWidth = width;
+	geometry.displayHeight = height;
+	geometry.blockWidth = (width + 16 - 1) / 16 + 1;
+	geometry.lumaWidth = geometry.blockWidth * 16;
+	geometry.blockHeight = (height + 16 - 1) / 16 + 1;
+	geometry.lumaHeight = geometry.blockHeight * 16;
+	geometry.chromaWidth = geometry.lumaWidth / 2;
+	geometry.chromaHeight = geometry.lumaHeight / 2;
+
+	display.destroy();
+	display.create(width, height);
+
+	buffer.current.destroy();
+	buffer.current.create(geometry.blockWidth, geometry.blockHeight);
+	for (int i = 0; i < geometry.blockWidth; ++i) {
+		buffer.current.info[i].initForPadding();
+	}
+	for (int i = 1; i < geometry.blockHeight; ++i) {
+		buffer.current.info[i * geometry.blockWidth].initForPadding();
+	}
+
+	context.hasCoeff.destroy();
+	context.hasCoeff.create(geometry.blockWidth, geometry.blockHeight);
+}
+
+void DecoderDriver::decodeMacroblock(int row, int column) {
+	short coefficient[25][16];
+	BlockInfo* info = buffer.current.info + row * geometry.blockWidth
+			+ column;
+	decodeBlockCoeff(coefficient, info, row, column);
+
+	predictLumaBlock(row, column, info, coefficient);
+	predictChromaBlock(row, column, info, coefficient);
+}
+
+void DecoderDriver::predictLumaBlock(int row, int column, BlockInfo* info,
+		short coefficient[25][16]) {
+	Pixel* above = buffer.current.luma + column * 16
+			+ geometry.lumaWidth * (row * 16 - 1);
+	Pixel* target = above + geometry.lumaWidth;
+	Pixel* left = target - 1;
+	if (info->lumaMode == kDummyLumaMode) {
+		if (column == geometry.blockWidth - 1) {
+			Pixel extra[4];
+			std::memset(extra, above[15], sizeof(extra));
+			predictBusyLuma(above, left, extra, target, info, coefficient);
+		} else {
+			predictBusyLuma(above, left, above + 16, target, info,
+					coefficient);
+		}
+		return;
+	}
+
+	predictWholeBlock<16>(row, column, above, left, target,
+			info->lumaMode);
+	short residual[16], dc[16];
+	if (info->lastCoeff[24] > 0) {
+		inverseWalshHadamardTransform(coefficient[24], dc);
+	} else {
+		std::memset(dc, 0, sizeof(dc));
+	}
+	for (int i = 0; i < 4; ++i) {
+		for (int j = 0; j < 4; ++j) {
+			if (dc[i * 4 + j] == 0 && info->lastCoeff[i * 4 + j] == 0) {
+				continue;
+			}
+			coefficient[i * 4 + j][0] = dc[i * 4 + j];
+			inverseDiscreteCosineTransform(coefficient[i * 4 + j],
+					residual);
+			for (int y = 0; y < 4; ++y) {
+				for (int x = 0; x < 4; ++x) {
+					Pixel* p = target + (i * 4 + y) * geometry.lumaWidth
+							+ j * 4 + x;
+					*p = clamp(*p + residual[y * 4 + x]);
+				}
+			}
+		}
+	}
+}
+
+void DecoderDriver::predictBusyLuma(Pixel* above, Pixel* left,
+		Pixel* extra, Pixel* target, BlockInfo* info,
+		short coefficient[25][16]) {
+	for (int row = 0; row < 4; ++row, above += 4 * geometry.lumaWidth) {
+		Pixel subblock[4][4];
+		short residual[16];
+		left = above + geometry.lumaWidth - 1;
+		for (int col = 0; col < 3; ++col, left += 4) {
+			predict4x4(subblock, above + col * 4, left,
+					above + col * 4 + 4, info->submode[row * 4 + col]);
+			inverseDiscreteCosineTransform(coefficient[row * 4 + col],
+					residual);
+			addSubblockResidual(row, col, target, residual, subblock);
+		}
+		predict4x4(subblock, above + 12, left, extra,
+				info->submode[row * 4 + 3]);
+		inverseDiscreteCosineTransform(coefficient[4 * row + 3], residual);
+		addSubblockResidual(row, 3, target, residual, subblock);
+	}
+}
+
+void DecoderDriver::predict4x4(Pixel b[4][4], Pixel* above, Pixel* left,
+		Pixel* extra, int8_t submode) {
 	Pixel E[9];
-	E[0] = left[3]; E[1] = left[2]; E[2] = left[1]; E[3] = left[0];
-	E[4] = corner; E[5] = above[0]; E[6] = above[1]; E[7] = above[2];
+	int lineSize = geometry.lumaWidth;
+	E[0] = left[3 * lineSize]; E[1] = left[2 * lineSize];
+	E[2] = left[lineSize]; E[3] = left[0];
+	E[4] = above[-1]; E[5] = above[0]; E[6] = above[1]; E[7] = above[2];
 	E[8] = above[3];
 	switch (submode) {
 	case kAverageSubmode: {
@@ -78,29 +616,31 @@ void DecoderDriver::predictSingleSubblock(Pixel b[4][4],
 			sum += above[i];
 		}
 		for (int i = 0; i < 4; ++i) {
-			sum += left[i];
+			sum += left[i * lineSize];
 		}
 		std::memset(b, (sum + 4) / 8, 16);
 		break; }
 	case kHorizontalSubmode: {
-		Pixel pixel = avg3(corner, left[0], left[1]);
+		Pixel pixel = avg3(left[-lineSize], left[0], left[lineSize]);
 		for (int j = 0; j < 4; ++j) {
 			b[0][j] = pixel;
 		}
 		for (int i = 1; i < 3; ++i) {
-			pixel = avg3(left[i - 1], left[i], left[i + 1]);
+			pixel = avg3(left[(i - 1) * lineSize], left[i * lineSize],
+					left[(i + 1) * lineSize]);
 			for (int j = 0; j < 4; ++j) {
 				b[i][j] = pixel;
 			}
 		}
-		pixel = avg3(left[2], left[3], left[3]);
+		pixel = avg3(left[2 * lineSize], left[3 * lineSize],
+				left[3 * lineSize]);
 		for (int j = 0; j < 4; ++j) {
 			b[3][j] = pixel;
 		}
 		break; }
 	case kVerticalSubmode:
 		for (int i = 0; i < 4; ++i) {
-			b[i][0] = avg3(corner, above[0], above[1]);
+			b[i][0] = avg3p(above);
 			for (int j = 1; j < 3; ++j) {
 				b[i][j] = avg3p(above + j);
 			}
@@ -110,7 +650,7 @@ void DecoderDriver::predictSingleSubblock(Pixel b[4][4],
 	case kTrueMotionSubmode:
 		for (int i = 0; i < 4; ++i) {
 			for (int j = 0; j < 4; ++j) {
-				b[i][j] = clamp(above[j] + left[i] - corner);
+				b[i][j] = clamp(above[j] + left[i * lineSize] - above[-1]);
 			}
 		}
 		break;
@@ -149,14 +689,16 @@ void DecoderDriver::predictSingleSubblock(Pixel b[4][4],
 		b[0][3] = avg3p(E + 6);
 		break;
 	case kHorizontalUpSubmode:
-		b[0][0] = avg2p(left);
-		b[0][1] = avg3p(left + 1);
-		b[0][2] = b[1][0] = avg2p(left + 1);
-		b[0][3] = b[1][1] = avg3p(left + 2);
-		b[1][2] = b[2][0] = avg2p(left + 2);
-		b[1][3] = b[2][1] = avg3(left[2], left[3], left[3]);
+		b[0][0] = avg2(left[0], left[lineSize]);
+		b[0][1] = avg3(left[0], left[lineSize], left[lineSize * 2]);
+		b[0][2] = b[1][0] = avg2(left[lineSize], left[lineSize * 2]);
+		b[0][3] = b[1][1] = avg3(left[lineSize], left[lineSize * 2],
+				left[lineSize * 3]);
+		b[1][2] = b[2][0] = avg2(left[lineSize * 2], left[lineSize * 3]);
+		b[1][3] = b[2][1] = avg3(left[lineSize * 2], left[lineSize * 3],
+				left[lineSize * 3]);
 		b[2][2] = b[2][3] = b[3][0] = b[3][1] = b[3][2] = b[3][3] =
-				left[3];
+				left[lineSize * 3];
 		break;
 	case kVerticalLeftSubmode:
 		b[0][0] = avg2p(above);
@@ -187,741 +729,111 @@ void DecoderDriver::predictSingleSubblock(Pixel b[4][4],
 	}
 }
 
-void DecoderDriver::decodeFrameHeader() {
-	if (context.keyFrame) {
-		if (source->uint<1>() != 0) {
-			RAISE(InvalidBoolString, "Color space other than YUV isn't "
-					"supported.");
-		}
-		context.disableClamping = source->uint<1>();
-	}
-	updateSegmentation();
-	updateLoopFilter();
-	context.log2PartitionCount = source->uint<2>();
-	if (context.log2PartitionCount != 0) {
-		RAISE(FeatureIncomplete, "Partitioning isn't supported");
-	}
-	updateQuantizerTable();
-	if (context.keyFrame) {
-		context.refreshProbability = source->uint<1>();
-	} else {
-		// TODO: Complete this branch
-	}
-	updateCoeffProbability();
-	context.skipping.enabled = source->uint<1>();
-	if (context.skipping.enabled) {
-		context.skipping.probability = source->uint<8>();
-	}
-	if (!context.keyFrame) {
-		// TODO: Complete this branch
-	}
-}
-
-void DecoderDriver::decodeBlockHeader(BlockInfo* info) {
-	if (context.segment.enabled && context.segment.updateMapping) {
-		info->segment = source->decode(kSegmentMappingTree,
-				context.segment.probability);
-	}
-	if (context.skipping.enabled) {
-		info->skipCoeff = source->decode(context.skipping.probability);
-	}
-	// TODO: Handle inter frames.
-	info->lumaMode = source->decode(kKeyFrameLumaModeTree,
-			kKeyFrameLumaModeProbability);
-	if (info->lumaMode == kDummyLumaMode) {
-		decodeSubmode(info);
-	} else {
-		std::memset(info->submode, getDummySubmode(info->lumaMode),
-				sizeof(info->submode));
-	}
-	info->chromaMode = source->decode(kChromaModeTree,
-			kKeyFrameChromaModeProbability);
-}
-
-void DecoderDriver::decodeSubmode(BlockInfo* info) {
-	BlockInfo* blockAbove = info - context.horizon.blockCount - 1;
-	int8_t* above = blockAbove->submode;
-	int8_t* left = (info - 1)->submode;
-	int8_t* dest = info->submode;
-	dest[0] = source->decode(kSubmodeTree,
-			kKeyFrameSubmodeProbability[above[12]][left[3]]);
-	for (int i = 1; i < 4; ++i) {
-		dest[i] = source->decode(kSubmodeTree,
-				kKeyFrameSubmodeProbability[above[12 + i]][dest[i - 1]]);
-	}
-	for (int i = 4; i < 16; ++i) {
-		if (i % 4 == 0) {
-			dest[i] = source->decode(kSubmodeTree,
-					kKeyFrameSubmodeProbability[dest[i - 4]][left[i + 3]]);
-		} else {
-			dest[i] = source->decode(kSubmodeTree,
-					kKeyFrameSubmodeProbability[dest[i - 4]][dest[i - 1]]);
-		}
-	}
-}
-
-short DecoderDriver::decodeSingleCoeff(const TreeIndex* tree,
-		const Probability* probability) {
-	short token = source->decode(tree, probability);
-	if (token == kCoeffTokenCount - 1) {
-		return kEndOfCoeff;
-	} else if (token == 0) {
-		return 0;
-	} else if (token >= 5) {
-		token = 3 + (1 << (token - 4)) + decodeTokenOffset(token);
-	}
-	return source->uint<1>() ? -token : token;
-}
-
-short DecoderDriver::decodeTokenOffset(int token) {
-	const static Probability kOffsetProbability[][12] = {
-		{ 159, 0},
-		{ 165, 145, 0},
-		{ 173, 148, 140, 0},
-		{ 176, 155, 140, 135, 0},
-		{ 180, 157, 141, 134, 130, 0},
-		{ 254, 254, 243, 230, 196, 177, 153, 140, 133, 130, 129, 0}
-	};
-	short offset = 0;
-	for (const Probability* p = kOffsetProbability[token - 5]; *p != 0;
-			++p) {
-		offset += offset + source->decode(*p);
-	}
-	return offset;
-}
-
-void DecoderDriver::decodeFrameTag(const void* data) {
-	const uint8_t* cursor = (const uint8_t*)data;
-	uint32_t raw = cursor[0] | ((uint32_t)cursor[1] << 8)
-			| ((uint32_t)cursor[2] << 16);
-	cursor += 3;
-	context.keyFrame = !(raw & 1);
-	context.version = (raw >> 1) & 7;
-	context.invisible = !((raw >> 4) & 1);
-	context.firstPartSize = (raw >> 5) & 0x7ffff;
-	if (context.keyFrame) {
-		if (cursor[0] != 0x9d || cursor[1] != 0x01 || cursor[2] != 0x2a) {
-			RAISE(InvalidBoolString,
-					"Cannot find start code in key frame.");
-		}
-		cursor += 3;
-		uint16_t tmp = cursor[0] | ((uint16_t)cursor[1] << 8);
-		cursor += 2;
-		context.horizon.scale = tmp >> 14;
-		int width = tmp & 0x3fff;
-		tmp = cursor[0] | ((uint16_t)cursor[1] << 8);
-		context.vertical.scale = tmp >> 14;
-		int height = tmp & 0x3fff;
-		if (width != context.horizon.length
-				|| height != context.vertical.length) {
-			resizeFrame(width, height);
-		}
-	}
-}
-
-void DecoderDriver::addChromaResidual(int block) {
-	BlockInfo* info = context.block[kCurrentFrame] + block;
-	if (context.skipping.enabled && info->skipCoeff) {
-		return;
-	}
-	short coefficient[16];
+void DecoderDriver::predictChromaBlock(int row, int column,
+		BlockInfo* info, short coefficient[25][16]) {
 	for (int p = 0; p < 2; ++p) {
-		FrameBuffer::Chroma* chroma =
-				context.buffer[kCurrentFrame]->chroma[p];
+		Pixel* above = buffer.current.chroma[p] + column * 8
+				+ (row * 8 - 1) * geometry.chromaWidth;
+		Pixel* target = above + geometry.chromaWidth;
+		Pixel* left = target - 1;
+		predictWholeBlock<8>(row, column, above, left, target,
+				info->chromaMode);
 		for (int i = 0; i < 2; ++i) {
 			for (int j = 0; j < 2; ++j) {
-				decodeCoeffArray(coefficient, false,
-						17 + p * 4 + i * 2 + j, kChromaPlane, info);
-				short pixel[16];
-				inverseDiscreteCosineTransform(coefficient, pixel);
-				for (int row = 0; row < 4; ++row) {
-					for (int col = 0; col < 4; ++col) {
-						int offset = i * 4 * 8 + row * 8 + j * 4 + col;
-						chroma[block][offset] =
-								clamp(pixel[ row * 4 + col]
-										+ chroma[block][offset]);
+				short residual[16];
+				int id = 16 + p * 4 + i * 2 + j;
+				inverseDiscreteCosineTransform(coefficient[id], residual);
+				for (int y = 0; y < 4; ++y) {
+					for (int x = 0; x < 4; ++x) {
+						int offset = (i * 4 + y) * geometry.chromaWidth
+								+ j * 4 + x;
+						target[offset] = clamp(
+								target[offset] + residual[y * 4 + x]);
 					}
 				}
 			}
 		}
 	}
-}
-
-void DecoderDriver::decodeCoeffArray(short* coefficient, bool acOnly,
-		int coeffArrayId, PlaneType plane, BlockInfo* info) {
-	const static int kZigZag[] = {
-		0,  1,  4,  8,  5,  2,  3,  6,  9, 12, 13, 10,  7, 11, 14, 15
-	};
-
-	std::memset(coefficient, 0, sizeof(*coefficient) * 16);
-
-	int first = acOnly ? 1 : 0;
-	short coeff = decodeSingleCoeff(kCoeffTokenTree,
-			selectCoeffProbability(coeffArrayId, plane, first, info));
-	if (coeff == kEndOfCoeff) {
-		return;
-	}
-	coefficient[kZigZag[first]] = coeff;
-	if (coeff != 0) {
-		info->hasCoeff[coeffArrayId] = true;
-	}
-	short previous = coeff;
-	for (int i = first + 1; i < 16; ++i, previous = coeff) {
-		int index;
-		switch (previous) {
-		case 0: index = 0; break;
-		case 1: case -1: index = 1; break;
-		default: index = 2; break;
-		}
-		if (previous == 0) {
-			coeff = decodeSingleCoeff(kSmallTokenTree,
-					context.coeff[plane][kCoeffBand[i]][index] + 1);
-		} else {
-			coeff = decodeSingleCoeff(kCoeffTokenTree,
-					context.coeff[plane][kCoeffBand[i]][index]);
-		}
-		if (coeff == kEndOfCoeff) {
-			break;
-		}
-		coefficient[kZigZag[i]] = coeff;
-		if (coeff != 0 && !info->hasCoeff[coeffArrayId]) {
-			info->hasCoeff[coeffArrayId] = true;
-		}
-	}
-	dequantizeCoefficient(coefficient, plane);
-}
-
-void DecoderDriver::updateLoopFilter() {
-	context.filter.type = source->uint<1>();
-	context.filter.level = source->uint<6>();
-	context.filter.sharpness = source->uint<3>();
-	context.filter.delta.enabled = source->uint<1>();
-	if (context.filter.delta.enabled && source->uint<1>()) {
-		for (int i = 0; i < 4; ++i) {
-			if (source->uint<1>()) {
-				context.filter.delta.reference[i] = source->sint<7>();
-			}
-		}
-		for (int i = 0; i < 4; ++i) {
-			if (source->uint<1>()) {
-				context.filter.delta.mode[i] = source->sint<7>();
-			}
-		}
-	}
-}
-
-void DecoderDriver::updateSegmentation() {
-	context.segment.enabled = source->uint<1>();
-	if (!context.segment.enabled) {
-		return;
-	}
-	RAISE(FeatureIncomplete, "Segmentation isn't supported");
-	context.segment.updateMapping = source->uint<1>();
-	bool updateFeature = source->uint<1>();
-	if (updateFeature) {
-		bool absoluteValue = source->uint<1>();
-		for (int i = 0; i < 4; ++i) {
-			int8_t value = 0;
-			if (source->uint<1>()) {
-				value = source->sint<8>();
-			}
-			if (absoluteValue) {
-				context.segment.quantizer[i] = value;
-			} else {
-				context.segment.quantizer[i] += value;
-			}
-		}
-		for (int i = 0; i < 4; ++i) {
-			int8_t value = 0;
-			if (source->uint<1>()) {
-				value = source->sint<7>();
-			}
-			if (absoluteValue) {
-				context.segment.loopFilter[i] = value;
-			} else {
-				context.segment.loopFilter[i] += value;
-			}
-		}
-	}
-	if (context.segment.updateMapping) {
-		for (size_t i = 0; i < ELEMENT_COUNT(context.segment.probability);
-				++i) {
-			Probability probability = 255;
-			if (source->uint<1>()) {
-				probability = source->uint<8>();
-			}
-			context.segment.probability[i] = probability;
-		}
-	}
-}
-
-void DecoderDriver::updateQuantizerTable() {
-	context.quantizer[0] = source->uint<7>();
-	for (int i = 1; i < kQuantizerCount; ++i) {
-		context.quantizer[i] = context.quantizer[0];
-		if (source->uint<1>()) {
-			int v = context.quantizer[0] + source->sint<5>();
-			if (v < 0) {
-				v = 0;
-			} else if (v > 127) {
-				v = 127;
-			}
-			context.quantizer[i] = v;
-		}
-	}
-}
-
-void DecoderDriver::updateCoeffProbability() {
-	for (int i = 0; i < 4; ++i) {
-		for (int j = 0; j < 8; ++j) {
-			for (int k = 0; k < 3; ++k) {
-				for (int l = 0; l < kCoeffTokenCount - 1; ++l) {
-					if (source->decode(
-							kCoeffUpdateProbability[i][j][k][l])) {
-						context.coeff[i][j][k][l] = source->uint<8>();
-					}
-				}
-			}
-		}
-	}
-}
-
-void DecoderDriver::update16x16Probability() {
-	if (source->uint<1>()) {
-		for (int i = 0; i < 4; ++i) {
-			source->uint<8>();
-		}
-	}
-}
-
-void DecoderDriver::updateChromaProbability() {
-	if (source->uint<1>()) {
-		for (int i = 0; i < 3; ++i) {
-			source->uint<8>();
-		}
-	}
-}
-
-void DecoderDriver::updateMotionVectorProbability() {
-	for (int i = 0; i < 2 * 19; ++i) {
-		if (source->uint<1>()) {
-			source->uint<7>();
-		}
-	}
-}
-
-void DecoderDriver::resizeFrame(int width, int height) {
-	context.horizon.length = width;
-	context.horizon.blockCount = (width + kBlockWidth - 1) / kBlockWidth;
-	context.vertical.length = height;
-	context.vertical.blockCount = (height + kBlockWidth - 1) / kBlockWidth;
-	int frameBlockCount = (context.vertical.blockCount + 1)
-			* (context.horizon.blockCount + 1);
-	for (size_t i = 0; i < ELEMENT_COUNT(context.block); ++i) {
-		delete[] context.block[i];
-		context.block[i] = new BlockInfo[frameBlockCount];
-	}
-	for (int i = 0; i < context.horizon.blockCount + 1; ++i) {
-		context.block[kCurrentFrame][i].initForPadding();
-	}
-	for (int i = context.horizon.blockCount + 1; i < frameBlockCount;
-			i += context.horizon.blockCount + 1) {
-		context.block[kCurrentFrame][i].initForPadding();
-	}
-
-	for (size_t i = 0; i < ELEMENT_COUNT(context.buffer); ++i) {
-		delete context.buffer[i];
-		context.buffer[i] = new FrameBuffer(context.horizon.blockCount,
-				context.vertical.blockCount);
-	}
-	for (int i = 0; i < 2; ++i) {
-		FrameBuffer::Chroma* chroma =
-				context.buffer[kCurrentFrame]->chroma[i];
-		for (int j = 0; j < context.horizon.blockCount + 1; ++j) {
-			std::memset(chroma[j], 127, sizeof(*chroma));
-		}
-		for (int j = 1; j < context.vertical.blockCount + 1; ++j) {
-			std::memset(chroma[j * context.horizon.blockCount],
-					129, sizeof(*chroma));
-		}
-	}
-
-	delete[] display.luma;
-	delete[] display.chroma[0];
-	delete[] display.chroma[1];
-	display.luma = new Pixel[width * height];
-	display.chroma[0] = new Pixel[width / 2 * height / 2];
-	display.chroma[1] = new Pixel[width / 2 * height / 2];
-}
-
-void DecoderDriver::buildMacroblock(int block) {
-	FrameBuffer* frame = context.buffer[kCurrentFrame];
-
-	decodeLumaBlock(frame->luma, block);
-
-	predictChromaBlock(frame->chroma[0], block);
-	predictChromaBlock(frame->chroma[1], block);
-	addChromaResidual(block);
-}
-
-void DecoderDriver::decodeLumaBlock(FrameBuffer::Luma* plane, int block) {
-	int offsetAbove = block - context.horizon.blockCount - 1;
-	Pixel above[16], left[16];
-	std::memcpy(above, &plane[offsetAbove][16 * 15], sizeof(above));
-	for (int i = 0; i < 16; ++i) {
-		left[i] = plane[block - 1][16 * i + 15];
-	}
-	BlockInfo* info = context.block[kCurrentFrame] + block;
-	Pixel corner = plane[offsetAbove - 1][16 * 16 - 1];
-	if (context.block[kCurrentFrame][block].lumaMode == kDummyLumaMode) {
-		Pixel extra[4];
-		if (block < (context.horizon.blockCount + 1) * 2) {
-			std::memset(extra, 127, sizeof(extra));
-		} else if (block % (context.horizon.blockCount + 1)
-				== context.horizon.blockCount) {
-			std::memset(extra, plane[offsetAbove][16 * 16 - 1],
-					sizeof(extra));
-		} else {
-			std::memcpy(extra, &plane[offsetAbove + 1][16 * 15],
-					sizeof(extra));
-		}
-		predictSubblock(plane, block, above, left, corner, extra);
-		return;
-	}
-
-	predictWholeBlock<16>(block, plane[block], above, left, corner,
-			context.block[kCurrentFrame][block].lumaMode);
-	if (context.skipping.enabled && info->skipCoeff) {
-		return;
-	}
-	short coefficient[16], pixel[16], dc[16];
-	decodeCoeffArray(coefficient, false, 0, kVirtualPlane, info);
-	inverseWalshHadamardTransform(coefficient, dc);
-	for (int i = 0; i < 16; ++i) {
-		decodeCoeffArray(coefficient, true, 1 + i, kPartialLumaPlane,
-				info);
-		coefficient[0] = dc[i];
-		inverseDiscreteCosineTransform(coefficient, pixel);
-		for (int y = 0; y < 4; ++y) {
-			for (int x = 0; x < 4; ++x) {
-				Pixel* p = plane[block] + i / 4 * 4 * 16 + y * 16
-						+ (i % 4) * 4 + x;
-				*p = clamp(*p + pixel[y * 4 + x]);
-			}
-		}
-	}
-}
-
-void DecoderDriver::predictSubblock(FrameBuffer::Luma* plane, int block,
-		Pixel* above, Pixel* left, Pixel corner, Pixel* extra) {
-	BlockInfo* info = context.block[kCurrentFrame] + block;
-	bool skipCoeff = context.skipping.enabled && info->skipCoeff;
-	Pixel subblock[4][4];
-	predictSingleSubblock(subblock, above, left, corner, above + 4,
-			info->submode[0]);
-	short coefficient[16], pixel[16];
-	if (!skipCoeff) {
-		decodeCoeffArray(coefficient, false, 1, kFullLumaPlane, info);
-		inverseDiscreteCosineTransform(coefficient, pixel);
-	} else {
-		std::memset(pixel, 0, sizeof(pixel));
-	}
-	for (int i = 0; i < 4; ++i) {
-		for (int j = 0; j < 4; ++j) {
-			plane[block][i * 16 + j] =
-					clamp(subblock[i][j] + pixel[i * 4 + j]);
-		}
-		left[i] = plane[block][i * 16 + 3];
-	}
-
-	for (int b = 1; b < 3; ++b) {
-		predictSingleSubblock(subblock, above + b * 4, left,
-				*(above + b * 4 - 1), above + b * 4 + 4,
-				info->submode[b]);
-		if (!skipCoeff) {
-			decodeCoeffArray(coefficient, false, 1 + b, kFullLumaPlane,
-					info);
-			inverseDiscreteCosineTransform(coefficient, pixel);
-		}
-
-		for (int i = 0; i < 4; ++i) {
-			for (int j = 0; j < 4; ++j) {
-				plane[block][i * 16 + b * 4 + j] =
-						clamp(subblock[i][j] + pixel[i * 4 + j]);
-			}
-			left[i] = plane[block][i * 16 + b * 4 + 3];
-		}
-	}
-
-	predictSingleSubblock(subblock, above + 12, left, *(above + 11), extra,
-			info->submode[3]);
-	if (!skipCoeff) {
-		decodeCoeffArray(coefficient, false, 4, kFullLumaPlane, info);
-		inverseDiscreteCosineTransform(coefficient, pixel);
-	}
-	for (int i = 0; i < 4; ++i) {
-		for (int j = 0; j < 4; ++j) {
-			plane[block][i * 16 + 12 + j] =
-					clamp(subblock[i][j] + pixel[i * 4 + j]);
-		}
-	}
-	for (int row = 1; row < 4; ++row) {
-		for (int col = 0; col < 3; ++col) {
-			above = &plane[block][row * 4 * 16 - 16];
-			if (col == 0) {
-				corner = plane[block - 1][row * 4 * 16 - 1];
-			} else {
-				corner = above[col * 4 - 1];
-			}
-			predictSingleSubblock(subblock, above + col * 4,
-					left + row * 4, corner, above + col * 4 + 4,
-					info->submode[row * 4 + col]);
-			if (!skipCoeff) {
-				decodeCoeffArray(coefficient, false, row * 4 + col + 1,
-						kFullLumaPlane, info);
-				inverseDiscreteCosineTransform(coefficient, pixel);
-			}
-			for (int i = 0; i < 4; ++i) {
-				for (int j = 0; j < 4; ++j) {
-					plane[block][row * 4 * 16 + i * 16 + col * 4 + j] =
-							clamp(subblock[i][j] + pixel[i * 4 + j]);
-				}
-				left[row * 4 + i] =
-						plane[block][row * 4 * 16 + i * 16 + col * 4 + 3];
-			}
-		}
-		predictSingleSubblock(subblock, above + 12, left + row * 4,
-				*(left + row * 4 - 1), extra, info->submode[row * 4 + 3]);
-		if (!skipCoeff) {
-			decodeCoeffArray(coefficient, false, row * 4 + 4,
-					kFullLumaPlane, info);
-			inverseDiscreteCosineTransform(coefficient, pixel);
-		}
-		for (int i = 0; i < 4; ++i) {
-			for (int j = 0; j < 4; ++j) {
-				plane[block][row * 4 * 16 + i * 16 + 12 + j] =
-						clamp(subblock[i][j] + pixel[i * 4 + j]);
-			}
-		}
-	}
-}
-
-void DecoderDriver::predictChromaBlock(FrameBuffer::Chroma* plane,
-		int block) {
-	int offsetAbove = block - context.horizon.blockCount - 1;
-	Pixel above[8], left[8];
-	std::memcpy(above, &plane[offsetAbove][8 * 7], sizeof(above));
-	for (int i = 0; i < 8; ++i) {
-		left[i] = plane[block - 1][8 * i + 7];
-	}
-	Pixel corner = plane[offsetAbove - 1][63];
-	predictWholeBlock<8>(block, plane[block], above, left, corner,
-			context.block[kCurrentFrame][block].chromaMode);
-}
-
-const Probability* DecoderDriver::selectCoeffProbability(int coeffArrayId,
-		PlaneType plane, int position, BlockInfo* info) {
-	const static int kAboveCoeff[] = {
-		0,
-		-13, -14, -15, -16, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12,
-		-19, -20, 17, 18, -23, -24, 21, 22
-	};
-	const static int kLeftCoeff[] = {
-		0,
-		-4, 1, 2, 3, -8, 5, 6, 7, -12, 9, 10, 11, -16, 13, 14, 15,
-		-18, 17, -20, 19, -22, 21, -24, 23
-	};
-	int neighbor = 0;
-	if (coeffArrayId == 0) {
-		for (BlockInfo* cursor = info - context.horizon.blockCount - 1,
-					*end = context.horizon.blockCount + 1
-							+ context.block[kCurrentFrame];
-				cursor > end;
-				cursor -= context.horizon.blockCount + 1) {
-			if (cursor->hasVirtualPlane()) {
-				neighbor += cursor->hasCoeff[0];
-				break;
-			}
-		}
-		int first = (info - context.block[kCurrentFrame])
-				/ (context.horizon.blockCount + 1)
-				* (context.horizon.blockCount + 1);
-		for (BlockInfo* end = context.block[kCurrentFrame] + first,
-						*cursor = info - 1;
-				cursor > end; --cursor) {
-			if (cursor->hasVirtualPlane()) {
-				neighbor += cursor->hasCoeff[0];
-				break;
-			}
-		}
-	} else {
-		BlockInfo* cursor;
-		int id = kAboveCoeff[coeffArrayId];
-		if (id < 0) {
-			cursor = info - context.horizon.blockCount - 1;
-			id = -id;
-		} else {
-			cursor = info;
-		}
-		if (cursor->hasCoeff[id]) {
-			++neighbor;
-		}
-
-		id = kLeftCoeff[coeffArrayId];
-		if (id < 0) {
-			cursor = info - 1;
-			id = -id;
-		} else {
-			cursor = info;
-		}
-		if (cursor->hasCoeff[id]) {
-			++neighbor;
-		}
-	}
-	return context.coeff[plane][kCoeffBand[position]][neighbor];
 }
 
 void DecoderDriver::dequantizeCoefficient(short* coefficient,
-		PlaneType plane) {
-	static const short kDcQuantizerTable[] = {
-		4,   5,   6,   7,   8,   9,  10,  10,   11,  12,  13,  14,  15,
-		16,  17,  17,  18,  19,  20,  20,  21,   21,  22,  22,  23,  23,
-		24,  25,  25,  26,  27,  28,  29,  30,   31,  32,  33,  34,  35,
-		36,  37,  37,  38,  39,  40,  41,  42,   43,  44,  45,  46,  46,
-		47,  48,  49,  50,  51,  52,  53,  54,   55,  56,  57,  58,  59,
-		60,  61,  62,  63,  64,  65,  66,  67,   68,  69,  70,  71,  72,
-		73,  74,  75,  76,  76,  77,  78,  79,   80,  81,  82,  83,  84,
-		85,  86,  87,  88,  89,  91,  93,  95,   96,  98, 100, 101, 102,
-		104, 106, 108, 110, 112, 114, 116, 118, 122, 124, 126, 128, 130,
-		132, 134, 136, 138, 140, 143, 145, 148, 151, 154, 157
+		PlaneType plane, int lastCoeff) {
+	int index = (plane == kFullLumaPlane) ? 0 : plane;
+	if (plane != kPartialLumaPlane) {
+		coefficient[0] *= context.quantizer.value[index][0];
+	}
+	const static int kLargestOffset[] = {
+		0, 1, 2, 5, 9, 9, 9, 9, 9, 10, 13, 14, 14, 14, 14, 15, 16
 	};
-	short factor = kDcQuantizerTable[getQuantizerIndex(plane, true)];
-	if (plane == kVirtualPlane) {
-		factor *= 2;
-	} else if (plane == kChromaPlane && factor > 132) {
-		factor = 132;
+	int end = kLargestOffset[lastCoeff];
+	for (int i = 1; i < end; ++i) {
+		coefficient[i] *= context.quantizer.value[index][1];
 	}
-	coefficient[0] *= factor;
-
-	static const short kAcQuantizerTable[] = {
-		4,   5,   6,   7,   8,   9,  10,  11,  12,  13,  14,  15,  16,
-		17,  18,  19,  20,  21,  22,  23,  24,  25,  26,  27,  28,  29,
-		30,  31,  32,  33,  34,  35,  36,  37,  38,  39,  40,  41,  42,
-		43,  44,  45,  46,  47,  48,  49,  50,  51,  52,  53,  54,  55,
-		56,  57,  58,  60,  62,  64,  66,  68,  70,  72,  74,  76,  78,
-		80,  82,  84,  86,  88,  90,  92,  94,  96,  98, 100, 102, 104,
-		106, 108, 110, 112, 114, 116, 119, 122, 125, 128, 131, 134, 137,
-		140, 143, 146, 149, 152, 155, 158, 161, 164, 167, 170, 173, 177,
-		181, 185, 189, 193, 197, 201, 205, 209, 213, 217, 221, 225, 229,
-		234, 239, 245, 249, 254, 259, 264, 269, 274, 279, 284,
-	};
-	factor = kAcQuantizerTable[getQuantizerIndex(plane, false)];
-	if (plane == kVirtualPlane) {
-		factor = factor * 155 / 100;
-		if (factor < 8) {
-			factor = 8;
-		}
-	}
-	for (int i = 1; i < 16; ++i) {
-		coefficient[i] *= factor;
-	}
-}
-
-int8_t DecoderDriver::getQuantizerIndex(PlaneType plane, bool first) {
-	switch (plane * 256 + first) {
-	case kChromaPlane * 256 + 1:
-		return context.quantizer[kChromaDc];
-	case kChromaPlane * 256:
-		return context.quantizer[kChromaAc];
-	case kVirtualPlane * 256 + 1:
-		return context.quantizer[kVirtualDc];
-	case kVirtualPlane * 256:
-		return context.quantizer[kVirtualAc];
-	case kFullLumaPlane * 256 + 1:
-	case kPartialLumaPlane * 256 + 1:
-		return context.quantizer[kLumaDc];
-	case kFullLumaPlane * 256:
-	case kPartialLumaPlane * 256:
-		return context.quantizer[kLumaAc];
-	default:
-		RAISE(Unpossible);
+	for (int i = end; i < 16; ++i) {
+		coefficient[i] = 0;
 	}
 }
 
 void DecoderDriver::writeDisplayBuffer() {
-	for (int i = 0; i < context.vertical.blockCount; ++i) {
-		for (int j = 0; j < context.horizon.blockCount; ++j) {
-			int tmp = (i + 1) * (context.horizon.blockCount + 1) + j + 1;
-			FrameBuffer::Luma* luma =
-					context.buffer[kCurrentFrame]->luma + tmp;
-			for (int row = 0;
-					row < 16 && row + i * 16 < context.vertical.length;
-					++row) {
-				Pixel* target = display.luma + j * 16
-						+ (row + i * 16) * context.horizon.length;
-				std::memcpy(target, *luma + row * 16, 16);
-			}
-		}
+	for (int i = 0; i < geometry.displayHeight; ++i) {
+		std::memcpy(display.luma + i * geometry.displayWidth,
+				buffer.current.luma + (i + 16) * geometry.lumaWidth + 16,
+				geometry.displayWidth);
 	}
-	int width = context.horizon.length / 2;
-	int height = context.vertical.length / 2;
 	for (int p = 0; p < 2; ++p) {
-		for (int i = 0; i < context.vertical.blockCount; ++i) {
-			for (int j = 0; j < context.horizon.blockCount; ++j) {
-				int tmp = (i + 1) * (context.horizon.blockCount + 1)
-						+ j + 1;
-				FrameBuffer::Chroma* chroma =
-						context.buffer[kCurrentFrame]->chroma[p] + tmp;
-				for (int row = 0; row < 8 && row + i * 8 < height;
-						++row) {
-					Pixel* target =
-							display.chroma[p] + (row + i * 8) * width
-							+ j * 8;
-					std::memcpy(target, *chroma + row * 8, 8);
-				}
-			}
+		for (int i = 0; i < geometry.displayHeight / 2; ++i) {
+			Pixel* src = buffer.current.chroma[p] + 8
+					+ (i + 8) * geometry.chromaWidth;
+			Pixel* dst = display.chroma[p]
+					+ i * geometry.displayWidth / 2;
+			std::memcpy(dst, src, geometry.displayWidth / 2);
 		}
 	}
 }
 
-template<int SIZE>
-void DecoderDriver::predictWholeBlock(int block, Pixel* data,
-		const Pixel* above, const Pixel* left, Pixel corner, int8_t mode) {
+template<int BLOCK_SIZE>
+void DecoderDriver::predictWholeBlock(int row, int column, Pixel* above,
+		Pixel* left, Pixel* target, int8_t mode) {
+	int lineSize = geometry.blockWidth * BLOCK_SIZE;
 	switch (mode) {
 	case kAverageMode: {
 		uint32_t sum = 0;
 		int total = 0;
-		if (block > (context.horizon.blockCount + 1) * 2) {
-			for (int i = 0; i < SIZE; ++i) {
+		if (row > 1) {
+			for (int i = 0; i < BLOCK_SIZE; ++i) {
 				sum += above[i];
 			}
-			sum += SIZE / 2;
-			total += SIZE;
+			sum += BLOCK_SIZE / 2;
+			total += BLOCK_SIZE;
 		}
-		if (block % (context.horizon.blockCount + 1) != 1) {
-			for (int i = 0; i < SIZE; ++i) {
-				sum += left[i];
+		if (column > 1) {
+			for (int i = 0; i < BLOCK_SIZE; ++i) {
+				sum += left[i * lineSize];
 			}
-			sum += SIZE / 2;
-			total += SIZE;
+			sum += BLOCK_SIZE / 2;
+			total += BLOCK_SIZE;
 		}
 		Pixel average = (total == 0) ? 128 : sum / total;
-		std::memset(data, average, SIZE * SIZE);
+		for (int i = 0; i < BLOCK_SIZE; ++i) {
+			std::memset(target + i * lineSize, average, BLOCK_SIZE);
+		}
 		break; }
 	case kHorizontalMode:
-		for (int i = 0; i < SIZE; ++i) {
-			std::memset(data + i * SIZE, left[i], SIZE);
+		for (int i = 0; i < BLOCK_SIZE; ++i) {
+			std::memset(target + lineSize * i, target[lineSize * i - 1],
+					BLOCK_SIZE);
 		}
 		break;
 	case kVerticalMode:
-		for (int i = 0; i < SIZE; ++i) {
-			std::memcpy(data + i * SIZE, above, SIZE);
+		for (int i = 0; i < BLOCK_SIZE; ++i) {
+			std::memcpy(target + lineSize * i, above, BLOCK_SIZE);
 		}
 		break;
 	case kTrueMotionMode:
-		for (int i = 0; i < SIZE; ++i) {
-			for (int j = 0; j < SIZE; ++j) {
-				data[i * SIZE + j] = clamp(above[j] + left[i] - corner);
+		for (int i = 0; i < BLOCK_SIZE; ++i) {
+			for (int j = 0; j < BLOCK_SIZE; ++j) {
+				target[i * lineSize + j] =
+						clamp(above[j] + left[i * lineSize] - above[-1]);
 			}
 		}
 		break;

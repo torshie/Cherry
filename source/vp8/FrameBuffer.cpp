@@ -1,23 +1,24 @@
-#include <cstring>
 #include <cherry/vp8/FrameBuffer.hpp>
 
 using namespace cherry;
 
-FrameBuffer::FrameBuffer(int width, int height) {
-	int blockCount = (width + 1) * (height + 1);
-	luma = new Luma[blockCount];
-	chroma[0] = new Chroma[blockCount];
-	chroma[1] = new Chroma[blockCount];
-
-	std::memset(luma, 127, sizeof(Luma) * (width + 1));
-	for (int i = 1; i < height + 1; ++i) {
-		std::memset(luma[i * (width + 1)], 129, sizeof(Luma));
+void FrameBuffer::create(int width, int height) {
+	luma = (Pixel*)allocate<16>(width * height * 16 * 16);
+	std::memset(luma + width * 16 * 15 + 16, 127,
+			width * 16 - 16);
+	luma[width * 16 * 15 + 15] = 128;
+	for (int i = 16; i < height * 16; ++i) {
+		luma[i * width * 16 + 15] = 129;
 	}
 
-	for (int i = 0; i < 2; ++i) {
-		std::memset(chroma[i], 127, sizeof(Chroma) * (width + 1));
-		for (int j = 0; j < height + 1; ++j) {
-			std::memset(chroma[i][j * (width + 1)], 129, sizeof(Chroma));
+	for (int p = 0; p < 2; ++p) {
+		chroma[p] = (Pixel*)allocate<8>(width * height * 8 * 8);
+		std::memset(chroma[p] + width * 8 * 7 + 8, 127,
+				width * 8 - 8);
+		for (int i = 8; i < height * 8; ++i) {
+			chroma[p][i * width * 8 + 7] = 129;
 		}
 	}
+
+	info = new BlockInfo[width * height];
 }

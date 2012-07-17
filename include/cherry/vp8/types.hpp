@@ -7,7 +7,6 @@ namespace cherry {
 
 typedef uint8_t Probability;
 typedef uint8_t Pixel;
-typedef int8_t TreeIndex;
 
 } // namespace cherry
 

@@ -6,7 +6,8 @@ using namespace cherry;
 
 int main() {
 	int data = 0xf1f2f380;
-	BoolDecoder decoder(&data, sizeof(data));
+	BoolDecoder decoder;
+	decoder.reload(&data, sizeof(data));
 	for (size_t i = 0; i < sizeof(data); ++i) {
 		std::printf("%x\n", decoder.uint<8>());
 	}

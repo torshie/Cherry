@@ -1,6 +1,5 @@
 #include <cstdio>
 #include <cherry/vp8/DecoderDriver.hpp>
-#include <cherry/utility/BoolString.hpp>
 #include <cherry/unpack/IvfUnpacker.hpp>
 #include <cherry/wrapper/wrapper.hpp>
 

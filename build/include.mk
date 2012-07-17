@@ -18,5 +18,7 @@ ifeq ($(MAKECMDGOALS),check-prereq)
 endif
 
 include $(PROJECT_ROOT)/build/config.mk
+-include config.mk
+
 include $(PROJECT_ROOT)/build/common.mk
 include $(PROJECT_ROOT)/build/target.mk

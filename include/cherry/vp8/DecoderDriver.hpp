@@ -1,90 +1,49 @@
 #ifndef _CHERRY_VP8_DECODER_DRIVER_HPP_INCLUDED_
 #define _CHERRY_VP8_DECODER_DRIVER_HPP_INCLUDED_
 
-#include <cstddef>
+#include <stdint.h>
 #include <cstring>
 #include <cherry/vp8/types.hpp>
 #include <cherry/vp8/const.hpp>
+#include <cherry/vp8/BlockInfo.hpp>
 #include <cherry/vp8/FrameBuffer.hpp>
-#include <cherry/utility/misc.hpp>
 #include <cherry/decode/BoolDecoder.hpp>
 
 namespace cherry {
 
 class DecoderDriver {
 public:
-	DecoderDriver() : source(NULL), frameData(NULL), frameSize(0) {
-		std::memset(&context, 0, sizeof(context));
-		std::memset(&display, 0, sizeof(display));
-		std::memcpy(&context.coeff, &kDefaultCoeff, sizeof(kDefaultCoeff));
-	}
-
-	~DecoderDriver() {
-		for (size_t i = 0; i < ELEMENT_COUNT(context.block); ++i) {
-			delete[] context.block[i];
-		}
-		for (size_t i = 0; i < ELEMENT_COUNT(context.buffer); ++i) {
-			delete context.buffer[i];
-		}
-		delete[] display.luma;
-		delete[] display.chroma[0];
-		delete[] display.chroma[1];
-		delete source;
-	}
+	DecoderDriver();
 
 	void decodeFrame();
 	void setFrameData(const void* data, size_t size);
 
-	Pixel* getChroma(int plane) const {
-		return display.chroma[plane];
+	void getImageSize(int* width, int* height) const {
+		*width = geometry.displayWidth;
+		*height = geometry.displayHeight;
 	}
 
 	Pixel* getLuma() const {
 		return display.luma;
 	}
 
-	void getImageSize(int* width, int* height) const {
-		*width = context.horizon.length;
-		*height = context.vertical.length;
+	Pixel* getChroma(int i) const {
+		return display.chroma[i];
 	}
 
 private:
-	enum FrameType {
-		kCurrentFrame, kGoldenFrame, kPreviousFrame, kAlternateFrame,
-	};
-
 	enum PlaneType {
 		kPartialLumaPlane, kVirtualPlane, kChromaPlane, kFullLumaPlane
 	};
 
-	struct BlockInfo {
-		bool skipCoeff;
-		bool hasCoeff[25];
-		int8_t lumaMode;
-		int8_t submode[16];
-		int8_t chromaMode;
-		int8_t segment;
-
-		BlockInfo() {
-			for (size_t i = 0; i < ELEMENT_COUNT(hasCoeff); ++i) {
-				hasCoeff[i] = false;
-			}
-		}
-
-		bool hasVirtualPlane() const {
-			return lumaMode != kDummyLumaMode;
-		}
-
-		void initForPadding() {
-			lumaMode = kAverageMode;
-			chromaMode = kAverageMode;
-			for (size_t i = 0; i < ELEMENT_COUNT(submode); ++i) {
-				submode[i] = kAverageMode;
-			}
-		}
+	enum QuantizerIndex {
+		kLumaAc, kLumaDc, kVirtualDc, kVirtualAc, kChromaDc, kChromaAc,
+		kQuantizerCount
 	};
 
-	BoolDecoder* source;
+	typedef Probability ProbabilityTable[8][3][kCoeffTokenCount - 1];
+
+	BoolDecoder source;
 	const void* frameData;
 	size_t frameSize;
 	struct {
@@ -100,18 +59,16 @@ private:
 			Probability probability;
 		} skipping;
 		struct {
-			uint8_t scale;
-			uint16_t length;
-			uint16_t blockCount;
-		} horizon, vertical;
-		struct {
 			bool enabled;
 			bool updateMapping;
 			Probability probability[kSegmentCount - 1];
 			int8_t quantizer[kSegmentCount];
 			int8_t loopFilter[kSegmentCount];
 		} segment;
-		int8_t quantizer[kQuantizerCount];
+		struct {
+			int index[kQuantizerCount];
+			short value[kQuantizerCount / 2][2];
+		} quantizer;
 		Probability coeff[4][8][3][kCoeffTokenCount - 1];
 		struct {
 			uint8_t type;
@@ -123,19 +80,66 @@ private:
 				int8_t mode[4];
 			} delta;
 		} filter;
-		BlockInfo* block[4];
-		FrameBuffer* buffer[4];
+		struct CoeffContext {
+			// Only 9 of the 12 booleans are used, the rest of are used
+			// for padding.
+			bool (*above)[12];
+			bool (*left)[12];
+
+			~CoeffContext() {
+				destroy();
+			}
+
+			void destroy() {
+				delete[] above;
+				delete[] left;
+			}
+
+			void create(int width, int height) {
+				above = new bool[width][12]();
+				left = new bool[height][12]();
+			}
+		} hasCoeff;
 	} context;
 	struct {
+		FrameBuffer current;
+	} buffer;
+	struct {
+		int displayWidth;
+		int displayHeight;
+		int lumaWidth;
+		int lumaHeight;
+		int blockWidth;
+		int blockHeight;
+		int chromaWidth;
+		int chromaHeight;
+	} geometry;
+	struct Display {
 		Pixel* luma;
 		Pixel* chroma[2];
+
+		Display() : luma(NULL) {
+			chroma[0] = chroma[1] = NULL;
+		}
+
+		~Display() {
+			destroy();
+		}
+
+		void create(int width, int height) {
+			luma = new Pixel[width * height];
+			chroma[0] = new Pixel[width / 2 * height / 2];
+			chroma[1] = new Pixel[width / 2 * height / 2];
+		}
+
+		void destroy() {
+			delete[] luma;
+			delete[] chroma[0];
+			delete[] chroma[1];
+		}
 	} display;
 
-	static int8_t getDummySubmode(int8_t intraMode);
 	static Pixel clamp(int value);
-	static void predictSingleSubblock(Pixel subblock[4][4],
-			Pixel* above, Pixel* left, Pixel coner, Pixel* extra,
-			int8_t submode);
 
 	static Pixel avg3(Pixel a, Pixel b, Pixel c) {
 		return (a + b + b + c + 2) / 4;
@@ -156,35 +160,40 @@ private:
 	void decodeFrameHeader();
 	void decodeBlockHeader(BlockInfo* meta);
 	void decodeSubmode(BlockInfo* meta);
-	short decodeSingleCoeff(const TreeIndex* tree,
-			const Probability* probability);
 	short decodeTokenOffset(int token);
 	void decodeFrameTag(const void* data);
-	void addChromaResidual(int block);
-	void decodeCoeffArray(short* coefficient, bool acOnly,
-			int coeffArrayId, PlaneType plane, BlockInfo* meta);
+	void addSubblockResidual(int row, int column, Pixel* target,
+			const short* residual, Pixel subblock[4][4]);
+	int decodeCoeffArray(short* coefficient, bool acOnly, PlaneType plane,
+			int ctx);
+	int decodeLargeCoeff(const Probability* probability);
+	void decodeBlockCoeff(short coefficient[25][16], BlockInfo* info,
+			int row, int column);
 	void updateLoopFilter();
 	void updateSegmentation();
-	void updateQuantizerTable();
+	void decodeQuantizerTable();
+	void updateQuantizerValue();
 	void updateCoeffProbability();
 	void update16x16Probability();
 	void updateChromaProbability();
 	void updateMotionVectorProbability();
 	void resizeFrame(int width, int height);
-	void buildMacroblock(int block);
-	void decodeLumaBlock(FrameBuffer::Luma* plane, int block);
-	void predictSubblock(FrameBuffer::Luma* plane, int block, Pixel* above,
-			Pixel* left, Pixel corner, Pixel* extra);
-	void predictChromaBlock(FrameBuffer::Chroma* plane, int block);
-	const Probability* selectCoeffProbability(int coeffArrayId,
-			PlaneType plane, int position, BlockInfo* meta);
-	void dequantizeCoefficient(short* coefficient, PlaneType plane);
-	int8_t getQuantizerIndex(PlaneType plane, bool first);
+	void decodeMacroblock(int row, int column);
+	void predictLumaBlock(int row, int column, BlockInfo* info,
+			short coefficient[25][16]);
+	void predictBusyLuma(Pixel* above, Pixel* left, Pixel* extra,
+			Pixel* target, BlockInfo* info, short coefficient[25][16]);
+	void predict4x4(Pixel subblock[4][4], Pixel* above,
+			Pixel* left, Pixel* extra, int8_t submode);
+	void predictChromaBlock(int row, int column, BlockInfo* info,
+			short coefficient[25][16]);
+	void dequantizeCoefficient(short* coefficient, PlaneType plane,
+			int lastCoeff);
 	void writeDisplayBuffer();
 
-	template<int SIZE>
-	void predictWholeBlock(int block, Pixel* data, const Pixel* above,
-			const Pixel* left, Pixel corner, int8_t mode);
+	template<int BLOCK_SIZE>
+	void predictWholeBlock(int row, int column, Pixel* above, Pixel* left,
+			Pixel* target, int8_t mode);
 };
 
 } // namespace cherry

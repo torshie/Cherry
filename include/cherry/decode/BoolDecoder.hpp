@@ -3,25 +3,54 @@
 
 #include <stdint.h>
 #include <cstddef>
+#include <cstdio>
 #include <cherry/vp8/types.hpp>
+#include <cherry/vp8/const.hpp>
 #include <cherry/utility/integer.hpp>
 
 namespace cherry {
 
 class BoolDecoder {
 public:
-	BoolDecoder(const void* input, size_t size);
+	void reload(const void* input, size_t size);
+	IntraMode decodeLumaMode();
+	IntraMode decodeChromaMode();
+	SubblockMode decodeSubblockMode(const Probability* probability);
+	int_fast8_t decodeSegmentId(const Probability* probability);
 
-	bool decode(Probability probability);
-	int8_t decode(const TreeIndex* tree, const Probability* table);
+	bool decode(Probability probability) {
+		uint32_t split = 1 + (length - 1) * probability / 256;
+		bool result = false;
+		if (value >= split * 256) {
+			result = true;
+			length -= split;
+			value -= split * 256;
+		} else {
+			length = split;
+		}
+
+		while (length < 128) {
+			value *= 2;
+			length *= 2;
+			++shift;
+			if (shift == 8) {
+				shift = 0;
+				if (cursor - buffer < (ptrdiff_t)size) {
+					value |= *cursor;
+					++cursor;
+				}
+			}
+		}
+
+		return result;
+	}
 
 	template<int WIDTH>
 	typename U<WIDTH>::T uint() {
 		typedef char _guard[WIDTH >= 1 && WIDTH <= 64 ? 1 : -1];
 		typename U<WIDTH>::T result = 0;
 		for (int i = 0; i < WIDTH; ++i) {
-			result *= 2;
-			result += decode(128);
+			result += result + decode(128);
 		}
 		return result;
 	}
