@@ -1,4 +1,4 @@
-* Use 32-bit or 64-bit intergers instead of 8-bit integers when predicting, 
+* Use 32-bit or 64-bit intergers instead of 8-bit integers when predicting,
   dequantizing and transforming if SIMD instructions are unavailable.
 * Replace function clamp() with some inlined assembly function.
 * Optimize IWHT and IDCT if there is no coefficient or only one

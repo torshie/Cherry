@@ -11,8 +11,13 @@ struct FrameBuffer {
 	friend class DecoderDriver;
 
 	BlockInfo* info;
-	Pixel* luma;
-	Pixel* chroma[2];
+	union {
+		struct __attribute__((__packed__)) {
+			Pixel* luma;
+			Pixel* chroma[2];
+		};
+		Pixel* plane[3];
+	};
 
 	FrameBuffer() : info(NULL), luma(NULL) {
 		chroma[0] = chroma[1] = NULL;

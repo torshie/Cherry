@@ -7,7 +7,9 @@
 #include <cherry/vp8/const.hpp>
 #include <cherry/vp8/BlockInfo.hpp>
 #include <cherry/vp8/FrameBuffer.hpp>
+#include <cherry/vp8/FilterParameter.hpp>
 #include <cherry/decode/BoolDecoder.hpp>
+#include <cherry/display/Display.hpp>
 
 namespace cherry {
 
@@ -23,12 +25,8 @@ public:
 		*height = geometry.displayHeight;
 	}
 
-	Pixel* getLuma() const {
-		return display.luma;
-	}
-
-	Pixel* getChroma(int i) const {
-		return display.chroma[i];
+	void setDisplay(Display* display) {
+		this->display = display;
 	}
 
 private:
@@ -41,7 +39,12 @@ private:
 		kQuantizerCount
 	};
 
+	enum LoopFilterType {
+		kNormalLoopFilter, kSimpleLoopFilter
+	};
+
 	typedef Probability ProbabilityTable[8][3][kCoeffTokenCount - 1];
+	template<int FILTER_TYPE> struct LoopFilter;
 
 	BoolDecoder source;
 	const void* frameData;
@@ -79,9 +82,10 @@ private:
 				int8_t reference[4];
 				int8_t mode[4];
 			} delta;
+			FilterParameter param[64];
 		} filter;
 		struct CoeffContext {
-			// Only 9 of the 12 booleans are used, the rest of are used
+			// Only 9 of the 12 booleans are used, the rest are used
 			// for padding.
 			bool (*above)[12];
 			bool (*left)[12];
@@ -114,32 +118,43 @@ private:
 		int chromaWidth;
 		int chromaHeight;
 	} geometry;
-	struct Display {
-		Pixel* luma;
-		Pixel* chroma[2];
+	Display* display;
 
-		Display() : luma(NULL) {
-			chroma[0] = chroma[1] = NULL;
+	static int8_t commonAdjust(bool useOuter, const Pixel* P1, Pixel* P0,
+			Pixel* Q0, const Pixel* Q1);
+	static void simpleFilter(uint8_t edge, const Pixel* p1,
+			Pixel* p0, Pixel* q0, const Pixel* q1);
+	static bool normalFilterSuitable(uint8_t neighbor, uint8_t edge,
+			int8_t p3, int8_t p2, int8_t p1, int8_t p0, int8_t q0,
+			int8_t q1, int8_t q2, int8_t q3);
+	static bool highEdgeVariance(uint8_t threshold, int8_t p1, int8_t p0,
+			int8_t q0, int8_t q1);
+	static void subblockFilter(uint8_t threshold, uint8_t neighbor,
+			uint8_t edge, Pixel* P3, Pixel* P2, Pixel* P1, Pixel* P0,
+			Pixel* Q0, Pixel* Q1, Pixel* Q2, Pixel* Q3);
+	static void normalFilter(uint8_t threshold, uint8_t neighbor,
+			uint8_t edge, Pixel* P3, Pixel* P2, Pixel* P1, Pixel* P0,
+			Pixel* Q0, Pixel* Q1, Pixel* Q2, Pixel* Q3);
+
+	static Pixel clamp(int value) {
+		if (value < 0) {
+			return 0;
+		} else if (value > 255) {
+			return 255;
+		} else {
+			return value;
 		}
+	}
 
-		~Display() {
-			destroy();
+	static int8_t signedClamp(int value) {
+		if (value < -128) {
+			return -128;
+		} else if (value > 127) {
+			return 127;
+		} else {
+			return value;
 		}
-
-		void create(int width, int height) {
-			luma = new Pixel[width * height];
-			chroma[0] = new Pixel[width / 2 * height / 2];
-			chroma[1] = new Pixel[width / 2 * height / 2];
-		}
-
-		void destroy() {
-			delete[] luma;
-			delete[] chroma[0];
-			delete[] chroma[1];
-		}
-	} display;
-
-	static Pixel clamp(int value);
+	}
 
 	static Pixel avg3(Pixel a, Pixel b, Pixel c) {
 		return (a + b + b + c + 2) / 4;
@@ -170,6 +185,7 @@ private:
 	void decodeBlockCoeff(short coefficient[25][16], BlockInfo* info,
 			int row, int column);
 	void updateLoopFilter();
+	void updateFilterParameterTable(uint8_t sharpness);
 	void updateSegmentation();
 	void decodeQuantizerTable();
 	void updateQuantizerValue();
@@ -190,7 +206,10 @@ private:
 	void dequantizeCoefficient(short* coefficient, PlaneType plane,
 			int lastCoeff);
 	void writeDisplayBuffer();
+	int getFilterLevel(BlockInfo* info);
 
+	template<int FILTER_TYPE>
+	void applyLoopFilter(int row, int column);
 	template<int BLOCK_SIZE>
 	void predictWholeBlock(int row, int column, Pixel* above, Pixel* left,
 			Pixel* target, int8_t mode);

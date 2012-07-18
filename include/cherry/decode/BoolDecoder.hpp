@@ -3,7 +3,6 @@
 
 #include <stdint.h>
 #include <cstddef>
-#include <cstdio>
 #include <cherry/vp8/types.hpp>
 #include <cherry/vp8/const.hpp>
 #include <cherry/utility/integer.hpp>

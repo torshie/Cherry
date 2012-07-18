@@ -5,6 +5,8 @@ SOURCE = decode/BoolDecoder.cpp \
 	unpack/IvfUnpacker.cpp \
 	vp8/DecoderDriver.cpp \
 	vp8/FrameBuffer.cpp \
+	vp8/FilterParameter.cpp \
+	display/DummyDisplay.cpp \
 	dsp/dsp.cpp
 
 -include $(call INCLUDE_PATH, $(SOURCE))

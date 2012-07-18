@@ -8,10 +8,70 @@
 #include <cherry/except/FeatureIncomplete.hpp>
 #include <cherry/dsp/dsp.hpp>
 
-using namespace cherry;
+namespace cherry { // "using namespace cherry" won't work here
 
+template<>
+struct DecoderDriver::LoopFilter<DecoderDriver::kSimpleLoopFilter> {
+	struct Helper {
+		Helper(const FilterParameter* param, Pixel* after, ptrdiff_t step,
+				bool subblock) {
+			if (subblock) {
+				edge = param->limit.subblock;
+			} else {
+				edge = param->limit.edge;
+			}
+			for (int i = 0; i < 4; ++i) {
+				segment[i] = after + (i - 2) * step;
+			}
+		}
+		uint8_t edge;
+		Pixel* segment[4];
+	};
 
-DecoderDriver::DecoderDriver() : frameData(NULL), frameSize(0) {
+	static void filter(const Helper* h) {
+		simpleFilter(h->edge, h->segment[0], h->segment[1],
+				h->segment[2], h->segment[3]);
+	}
+};
+
+template<>
+struct DecoderDriver::LoopFilter<DecoderDriver::kNormalLoopFilter> {
+	struct Helper {
+		Helper(const FilterParameter* param, Pixel* after, ptrdiff_t step,
+				bool subblock)
+				: neighbor(param->limit.neighbor),
+				threshold(param->threshold), subblock(subblock) {
+			if (subblock) {
+				edge = param->limit.subblock;
+			} else {
+				edge = param->limit.edge;
+			}
+			for (int i = 0; i < 8; ++i) {
+				segment[i] = after + (i - 4) * step;
+			}
+		}
+		uint8_t edge, neighbor, threshold;
+		bool subblock;
+		Pixel* segment[8];
+	};
+
+	static void filter(const Helper* h) {
+		if (h->subblock) {
+			subblockFilter(h->threshold, h->neighbor, h->edge,
+					h->segment[0], h->segment[1], h->segment[2],
+					h->segment[3], h->segment[4], h->segment[5],
+					h->segment[6], h->segment[7]);
+		} else {
+			normalFilter(h->threshold, h->neighbor, h->edge,
+					h->segment[0], h->segment[1], h->segment[2],
+					h->segment[3], h->segment[4], h->segment[5],
+					h->segment[6], h->segment[7]);
+		}
+	}
+};
+
+DecoderDriver::DecoderDriver()
+		: frameData(NULL), frameSize(0), display(NULL) {
 	const static Probability
 	kDefaultCoeff[4][8][3][kCoeffTokenCount - 1] = {
 #include <table/probability/defaultCoefficient.i>
@@ -22,6 +82,7 @@ DecoderDriver::DecoderDriver() : frameData(NULL), frameSize(0) {
 	for (size_t i = 0; i < ELEMENT_COUNT(context.quantizer.index); ++i) {
 		context.quantizer.index[i] = -1;
 	}
+	context.filter.sharpness = 0xff;
 }
 
 void DecoderDriver::decodeFrame() {
@@ -44,7 +105,19 @@ void DecoderDriver::decodeFrame() {
 		}
 	}
 
-	// TODO apply loop filters
+	if (context.filter.type == kSimpleLoopFilter) {
+		for (int i = 1; i < geometry.blockHeight; ++i) {
+			for (int j = 1; j < geometry.blockWidth; ++j) {
+				applyLoopFilter<kSimpleLoopFilter>(i, j);
+			}
+		}
+	} else {
+		for (int i = 1; i < geometry.blockHeight; ++i) {
+			for (int j = 1; j < geometry.blockWidth; ++j) {
+				applyLoopFilter<kNormalLoopFilter>(i, j);
+			}
+		}
+	}
 
 	writeDisplayBuffer();
 }
@@ -58,13 +131,82 @@ void DecoderDriver::setFrameData(const void* data, size_t size) {
 	source.reload((const char*)data + tagSize, size - tagSize);
 }
 
-Pixel DecoderDriver::clamp(int value) {
-	if (value < 0) {
-		return 0;
-	} else if (value > 255) {
-		return 255;
+int8_t DecoderDriver::commonAdjust(bool useOuter, const Pixel* P1,
+		Pixel* P0, Pixel* Q0, const Pixel* Q1) {
+	int8_t p1 = *P1 - 128;
+	int8_t p0 = *P0 - 128;
+	int8_t q0 = *Q0 - 128;
+	int8_t q1 = *Q1 - 128;
+
+	int8_t a = signedClamp(
+			(q0 - p0) * 3 + (useOuter ? signedClamp(p1 - q1) : 0));
+	int8_t b = (signedClamp(a + 3)) >> 3;
+	a = signedClamp(a + 4) >> 3;
+	*Q0 = (q0 - a) + 128;
+	*P0 = (p0 + b) + 128;
+
+	return a;
+}
+
+void DecoderDriver::simpleFilter(uint8_t edge, const Pixel* p1,
+		Pixel* p0, Pixel* q0, const Pixel* q1) {
+	if (std::abs(*p0 - *q0) * 2 + std::abs(*p1 - *q1) / 2 <= edge) {
+		commonAdjust(true, p1, p0, q0, q1);
+	}
+}
+
+bool DecoderDriver::normalFilterSuitable(uint8_t neighbor, uint8_t edge,
+		int8_t p3, int8_t p2, int8_t p1, int8_t p0, int8_t q0, int8_t q1,
+		int8_t q2, int8_t q3) {
+	return  (std::abs(p0 - q0) * 2 + std::abs(p1 - q1) / 2) <= edge
+			&& std::abs(p3 - p2) <= neighbor
+			&& std::abs(p2 - p1) <= neighbor
+			&& std::abs(p1 - p0) <= neighbor
+			&& std::abs(q3 - q2) <= neighbor
+			&& std::abs(q2 - q1) <= neighbor
+			&& std::abs(q1 - q0) <= neighbor;
+}
+
+bool DecoderDriver::highEdgeVariance(uint8_t threshold, int8_t p1,
+		int8_t p0, int8_t q0, int8_t q1) {
+	return std::abs(p1 - p0) > threshold || std::abs(q1 - q0) > threshold;
+}
+
+void DecoderDriver::subblockFilter(uint8_t threshold, uint8_t neighbor,
+		uint8_t edge, Pixel* P3, Pixel* P2, Pixel* P1, Pixel* P0,
+		Pixel* Q0, Pixel* Q1, Pixel* Q2, Pixel* Q3) {
+	int8_t p3 = *P3 - 128, p2 = *P2 - 128, p1 = *P1 - 128, p0 = *P0 - 128,
+			q0 = *Q0 - 128, q1 = *Q1 - 128, q2 = *Q2 - 128, q3 = *Q3 - 128;
+	if (normalFilterSuitable(neighbor, edge, q3, q2, q1, q0,
+			p0, p1, p2, p3)) {
+		bool hv = highEdgeVariance(threshold, p1, p0, q0, q1);
+		int8_t a = (commonAdjust(hv, P1, P0, Q0, Q1) + 1) >> 1;
+		if (!hv) {
+			*Q1 = (q1 - a) + 128;
+			*P1 = (p1 + a) + 128;
+		}
+	}
+}
+
+void DecoderDriver::normalFilter(uint8_t threshold, uint8_t neighbor,
+		uint8_t edge, Pixel* P3, Pixel* P2, Pixel* P1, Pixel* P0,
+		Pixel* Q0, Pixel* Q1, Pixel* Q2, Pixel* Q3) {
+	int8_t p3 = *P3 - 128, p2 = *P2 - 128, p1 = *P1 - 128, p0 = *P0 - 128,
+			q0 = *Q0 - 128, q1 = *Q1 - 128, q2 = *Q2 - 128, q3 = *Q3 - 128;
+	if (!normalFilterSuitable(neighbor, edge, q3, q2, q1, q0,
+			p0, p1, p2, p3)) {
+		return;
+	}
+	if (!highEdgeVariance(threshold, p1, p0, q0, q1)) {
+		int8_t w = signedClamp(signedClamp(p1 - q1) + 3 * (q0 - p0));
+		int8_t a = signedClamp((27 * w + 63) >> 7);
+		*Q0 = (q0 - a) + 128;  *P0 = (p0 + a) + 128;
+		a = signedClamp((18 * w + 63) >> 7);
+		*Q1 = (q1 - a) + 128;  *P1 = (p1 + a) + 128;
+		a = signedClamp((9 * w + 63) >> 7);
+		*Q2 = (q2 - a) + 128;  *P2 = (p2 + a) + 128;
 	} else {
-		return value;
+		commonAdjust(true, P1, P0, Q0, Q1);
 	}
 }
 
@@ -201,10 +343,10 @@ void DecoderDriver::addSubblockResidual(int row, int column, Pixel* target,
 //   +--(0)---+
 //   |        |
 // (End)  +--(1)---+
-//        |        |
-//        0  +----(2)------+                       +-- This subtree is
-//           |             |                       |   decoded by method
-//           1   +--------(3)---------------+  <<--+   decodeLargeCoeff()
+//        |        |                        +-------- This subtree is
+//        0  +----(2)------+                |         decoded by method
+//           |             |                V         decodeLargeCoeff()
+//           1   +--------(3)---------------+
 //               |                          |
 //     +--------(4)---+             +------(6)-------+
 //     |              |             |                |
@@ -217,7 +359,7 @@ void DecoderDriver::addSubblockResidual(int row, int column, Pixel* target,
 int DecoderDriver::decodeCoeffArray(short* coefficient, bool acOnly,
 		PlaneType plane, int ctx) {
 	const static int kZigZag[] = {
-		0,  1,  4,  8,  5,  2,  3,  6,  9, 12, 13, 10,  7, 11, 14, 15
+		0, 1, 4, 8, 5, 2, 3, 6, 9, 12, 13, 10, 7, 11, 14, 15
 	};
 	const static int kCoeffBand[] = {
 		0, 1, 2, 3, 6, 4, 5, 6, 6, 6, 6, 6, 6, 6, 6, 7, 0
@@ -300,6 +442,7 @@ void DecoderDriver::decodeBlockCoeff(short coefficient[25][16],
 		}
 		return;
 	}
+	int total = 0;
 	bool acOnly = false;
 	PlaneType lumaType = kFullLumaPlane;
 	if (info->hasVirtualPlane()) {
@@ -312,6 +455,7 @@ void DecoderDriver::decodeBlockCoeff(short coefficient[25][16],
 						(info->lastCoeff[24] > 0);
 		acOnly = true;
 		lumaType = kPartialLumaPlane;
+		total += info->lastCoeff[24];
 	}
 	for (int i = 0; i < 4; ++i) {
 		for (int j = 0; j < 4; ++j) {
@@ -323,6 +467,7 @@ void DecoderDriver::decodeBlockCoeff(short coefficient[25][16],
 			context.hasCoeff.above[column][j] =
 					context.hasCoeff.left[row][i] =
 							(info->lastCoeff[id] > 0);
+			total += info->lastCoeff[id];
 		}
 	}
 	for (int p = 0; p < 2; ++p) {
@@ -336,15 +481,23 @@ void DecoderDriver::decodeBlockCoeff(short coefficient[25][16],
 				context.hasCoeff.above[column][4 + p * 2 + j] =
 						context.hasCoeff.left[row][4 + p * 2 + i] =
 								(info->lastCoeff[id] > 0);
+				total += info->lastCoeff[id];
 			}
 		}
+	}
+	if (total == 0) {
+		info->skipCoeff = true;
 	}
 }
 
 void DecoderDriver::updateLoopFilter() {
 	context.filter.type = source.uint<1>();
 	context.filter.level = source.uint<6>();
-	context.filter.sharpness = source.uint<3>();
+	uint8_t tmp = source.uint<3>();
+	if (context.filter.sharpness != tmp) {
+		context.filter.sharpness = tmp;
+		updateFilterParameterTable(tmp);
+	}
 	context.filter.delta.enabled = source.uint<1>();
 	if (context.filter.delta.enabled && source.uint<1>()) {
 		for (int i = 0; i < 4; ++i) {
@@ -357,6 +510,13 @@ void DecoderDriver::updateLoopFilter() {
 				context.filter.delta.mode[i] = source.sint<7>();
 			}
 		}
+	}
+}
+
+void DecoderDriver::updateFilterParameterTable(uint8_t sharpness) {
+	// The first element is ignored.
+	for (size_t i = 1; i < ELEMENT_COUNT(context.filter.param); ++i) {
+		context.filter.param[i].init(i, sharpness);
 	}
 }
 
@@ -509,8 +669,7 @@ void DecoderDriver::resizeFrame(int width, int height) {
 	geometry.chromaWidth = geometry.lumaWidth / 2;
 	geometry.chromaHeight = geometry.lumaHeight / 2;
 
-	display.destroy();
-	display.create(width, height);
+	display->resize(width, height);
 
 	buffer.current.destroy();
 	buffer.current.create(geometry.blockWidth, geometry.blockHeight);
@@ -776,7 +935,7 @@ void DecoderDriver::dequantizeCoefficient(short* coefficient,
 
 void DecoderDriver::writeDisplayBuffer() {
 	for (int i = 0; i < geometry.displayHeight; ++i) {
-		std::memcpy(display.luma + i * geometry.displayWidth,
+		display->write(0,
 				buffer.current.luma + (i + 16) * geometry.lumaWidth + 16,
 				geometry.displayWidth);
 	}
@@ -784,9 +943,94 @@ void DecoderDriver::writeDisplayBuffer() {
 		for (int i = 0; i < geometry.displayHeight / 2; ++i) {
 			Pixel* src = buffer.current.chroma[p] + 8
 					+ (i + 8) * geometry.chromaWidth;
-			Pixel* dst = display.chroma[p]
-					+ i * geometry.displayWidth / 2;
-			std::memcpy(dst, src, geometry.displayWidth / 2);
+			display->write(p + 1, src, geometry.displayWidth / 2);
+		}
+	}
+	display->flush();
+}
+
+int DecoderDriver::getFilterLevel(BlockInfo* info) {
+	if (!context.filter.delta.enabled) {
+		return context.filter.level;
+	}
+	// TODO Handle inter frames.
+	int level = context.filter.level
+			+ context.filter.delta.reference[0];
+	if (info->lumaMode == kDummyLumaMode) {
+		level += context.filter.delta.mode[0];
+	}
+	return (level < 0) ? 0 : ((level > 63) ? 63 : level);
+}
+
+template<int FILTER_TYPE>
+void DecoderDriver::applyLoopFilter(int row, int column) {
+	BlockInfo* info = buffer.current.info + column
+			+ row * geometry.blockWidth;
+	int level = getFilterLevel(info);
+	if (level == 0) {
+		return;
+	}
+	const FilterParameter* param = context.filter.param + level;
+
+	const static int kSize[3] = {
+		16,
+		8 * (FILTER_TYPE != kSimpleLoopFilter),
+		8 * (FILTER_TYPE != kSimpleLoopFilter)
+	};
+	if (column != 1) {
+		for (int p = 0; p < 3; ++p) {
+			for (int i = 0; i < kSize[p]; ++i) {
+				Pixel* after = buffer.current.plane[p] + column * kSize[p]
+						+ (row * kSize[p] + i)
+								* geometry.blockWidth * kSize[p];
+				typename LoopFilter<FILTER_TYPE>::Helper
+						tmp(param, after, 1, false);
+				LoopFilter<FILTER_TYPE>::filter(&tmp);
+			}
+		}
+	}
+	if (info->lumaMode == kDummyLumaMode || !info->skipCoeff) {
+		for (int p = 0; p < 3; ++p) {
+			for (int j = 4; j < kSize[p]; j += 4) {
+				for (int i = 0; i < kSize[p]; ++i) {
+					Pixel* after = buffer.current.plane[p] + j
+							+ column * kSize[p]
+							+ (row * kSize[p] + i) * kSize[p]
+									* geometry.blockWidth;
+					typename LoopFilter<FILTER_TYPE>::Helper
+							tmp(param, after, 1, true);
+					LoopFilter<FILTER_TYPE>::filter(&tmp);
+				}
+			}
+		}
+	}
+	if (row != 1) {
+		for (int p = 0; p < 3; ++p) {
+			for (int i = 0; i < kSize[p]; ++i) {
+				Pixel* after = buffer.current.plane[p] + i
+						+ row * kSize[p] * geometry.blockWidth * kSize[p]
+						+ column * kSize[p];
+				typename LoopFilter<FILTER_TYPE>::Helper
+						tmp(param, after, geometry.blockWidth * kSize[p],
+								false);
+				LoopFilter<FILTER_TYPE>::filter(&tmp);
+			}
+		}
+	}
+	if (info->lumaMode == kDummyLumaMode || !info->skipCoeff) {
+		for (int p = 0; p < 3; ++p) {
+			for (int j = 4; j < kSize[p]; j += 4) {
+				for (int i = 0; i < kSize[p]; ++i) {
+					Pixel* after = buffer.current.plane[p] + i
+							+ column * kSize[p]
+							+ (row * kSize[p] + j)
+									* geometry.blockWidth * kSize[p];
+					typename LoopFilter<FILTER_TYPE>::Helper
+							tmp(param, after,
+									geometry.blockWidth * kSize[p], true);
+					LoopFilter<FILTER_TYPE>::filter(&tmp);
+				}
+			}
 		}
 	}
 }
@@ -841,3 +1085,5 @@ void DecoderDriver::predictWholeBlock(int row, int column, Pixel* above,
 		RAISE(Unpossible);
 	}
 }
+
+} // namespace cherry

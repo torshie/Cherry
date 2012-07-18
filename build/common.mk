@@ -16,12 +16,6 @@ ifneq ($(BUILD_MODE),debug)
     endif
 endif
 
-ifeq ($(TRAP_INTEGER_OVERFLOW),yes)
-    ifeq ($(BUILD_MODE),debug)
-        CXXFLAGS += -ftrapv
-    endif
-endif
-
 RELATIVE_PATH = $(subst $(PROJECT_ROOT),,$(CURDIR))
 
 BINARY_DIRECTORY = $(BINARY_ROOT)$(RELATIVE_PATH)
