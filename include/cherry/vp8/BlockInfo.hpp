@@ -8,12 +8,12 @@
 namespace cherry {
 
 struct BlockInfo {
-	bool skipCoeff;
+	int8_t submode[16];
 	int8_t lastCoeff[25];
 	int8_t lumaMode;
-	int8_t submode[16];
 	int8_t chromaMode;
 	int8_t segment;
+	bool skipCoeff;
 
 	BlockInfo() {
 		std::memset(lastCoeff, 0, sizeof(lastCoeff));

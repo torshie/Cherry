@@ -6,7 +6,7 @@
 namespace cherry {
 
 enum FilterType {
-	kNormalFilter, kSimpleFilter, kFilterTypeCount
+	kNormalFilter, kSimpleFilter
 };
 
 enum IntraMode {

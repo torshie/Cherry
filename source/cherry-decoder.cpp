@@ -1,5 +1,5 @@
 #include <cstdio>
-#include <cherry/vp8/DecoderDriver.hpp>
+#include <cherry/vp8/MainDecoder.hpp>
 #include <cherry/unpack/IvfUnpacker.hpp>
 #include <cherry/display/DummyDisplay.hpp>
 #include <cherry/wrapper/wrapper.hpp>
@@ -18,10 +18,10 @@ int main(int argc, char** argv) {
 		std::fprintf(stderr, "Failed to get compressed frame data\n");
 		return 1;
 	}
-	DecoderDriver driver;
+	MainDecoder decoder;
 	DummyDisplay display(argv[2]);
-	driver.setDisplay(&display);
-	driver.setFrameData(frame, size);
-	driver.decodeFrame();
+	decoder.setDisplay(&display);
+	decoder.setFrameData(frame, size);
+	decoder.decodeFrame();
 	return 0;
 }

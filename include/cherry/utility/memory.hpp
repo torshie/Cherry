@@ -8,19 +8,20 @@ namespace cherry {
 
 template<int ALIGNMENT>
 inline void* allocate(size_t size) {
-	uintptr_t location = (uintptr_t)std::malloc(size + ALIGNMENT);
-	uintptr_t shift = location % ALIGNMENT;
-	if (shift != 0) {
-		location += ALIGNMENT - shift;
-		*(int8_t*)(location - 1) = ALIGNMENT - shift;
+	uint8_t* pointer = (uint8_t*)std::malloc(size + ALIGNMENT * 2);
+	uint8_t shift = ALIGNMENT;
+	if ((uintptr_t)pointer % ALIGNMENT != 0) {
+		shift += ALIGNMENT - (uintptr_t)pointer % ALIGNMENT;
 	}
-	return (void*)location;
+	pointer += shift;
+	pointer[-ALIGNMENT] = shift;
+	return (void*)pointer;
 }
 
 template<int ALIGNMENT>
 inline void release(void* pointer) {
-	if ((uintptr_t)pointer % ALIGNMENT != 0) {
-		pointer = (char*)pointer - *((int8_t*)pointer - 1);
+	if (pointer != NULL) {
+		pointer = (uint8_t*)pointer - *((uint8_t*)pointer - ALIGNMENT);
 	}
 	std::free(pointer);
 }

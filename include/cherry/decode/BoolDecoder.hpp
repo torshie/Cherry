@@ -9,6 +9,7 @@
 
 namespace cherry {
 
+class ProbabilityManager;
 class BoolDecoder {
 public:
 	void reload(const void* input, size_t size);
@@ -16,6 +17,8 @@ public:
 	IntraMode decodeChromaMode();
 	SubblockMode decodeSubblockMode(const Probability* probability);
 	int_fast8_t decodeSegmentId(const Probability* probability);
+	int decodeCoeff(short* coefficient, bool acOnly, int plane,
+			int context, ProbabilityManager* pm);
 
 	bool decode(Probability probability) {
 		uint32_t split = 1 + (length - 1) * probability / 256;
@@ -72,6 +75,9 @@ private:
 	const uint8_t* buffer;
 	const uint8_t* cursor;
 	size_t size;
+
+	int decodeLargeCoeff(const Probability* probability);
+	short decodeTokenOffset(int category);
 };
 
 } // namespace cherry
