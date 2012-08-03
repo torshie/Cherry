@@ -101,7 +101,7 @@ private:
 	void decodeFrameHeader();
 	void decodeBlockInfo(BlockInfo* meta);
 	void decodeSubmode(BlockInfo* meta);
-	void decodeFrameTag(const void* data);
+	int decodeFrameTag(const void* data);
 	void decodeBlockCoeff(short coefficient[25][16], BlockInfo* info,
 			int row, int column);
 	void updateSegmentation();

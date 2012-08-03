@@ -12,7 +12,7 @@ void ProbabilityManager::reset() {
 	std::memcpy(&coeff, &kCoeff, sizeof(coeff));
 }
 
-void ProbabilityManager::loadCoeff(BoolDecoder* source) {
+void ProbabilityManager::loadCoeffProb(BoolDecoder* source) {
 	const static Probability
 	kProbability[4][8][3][kCoeffTokenCount - 1] = {
 #include <table/probability/updateCoefficient.i>
@@ -26,6 +26,27 @@ void ProbabilityManager::loadCoeff(BoolDecoder* source) {
 					}
 				}
 			}
+		}
+	}
+}
+
+void ProbabilityManager::loadReferenceProb(BoolDecoder* source) {
+	reference.intra = source->uint<8>();
+	reference.last = source->uint<8>();
+	reference.golden = source->uint<8>();
+	if (source->uint<1>()) {
+		for (int i = 0; i < 4; ++i) {
+			source->uint<8>();
+		}
+	}
+	if (source->uint<1>()) {
+		for (int i = 0; i < 3; ++i) {
+			source->uint<8>();
+		}
+	}
+	for (int i = 0; i < 2 * 19; ++i) {
+		if (source->uint<1>()) {
+			source->uint<7>();
 		}
 	}
 }

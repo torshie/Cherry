@@ -14,10 +14,16 @@ public:
 	}
 
 	void reset();
-	void loadCoeff(BoolDecoder* source);
+	void loadCoeffProb(BoolDecoder* source);
+	void loadReferenceProb(BoolDecoder* source);
 
 private:
 	Probability coeff[4][8][3][kCoeffTokenCount - 1];
+	struct {
+		Probability intra;
+		Probability last;
+		Probability golden;
+	} reference;
 };
 
 } // namespace cherry

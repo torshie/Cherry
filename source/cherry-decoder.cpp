@@ -12,16 +12,15 @@ int main(int argc, char** argv) {
 		return 1;
 	}
 	IvfUnpacker unpacker(argv[1]);
-	int size = 0;
-	const void* frame = unpacker.getCompressedFrame(&size);
-	if (frame == NULL) {
-		std::fprintf(stderr, "Failed to get compressed frame data\n");
-		return 1;
-	}
 	MainDecoder decoder;
 	DummyDisplay display(argv[2]);
 	decoder.setDisplay(&display);
-	decoder.setFrameData(frame, size);
-	decoder.decodeFrame();
+	int size = 0;
+	const void* frame = unpacker.getCompressedFrame(&size);
+	while (frame != NULL) {
+		decoder.setFrameData(frame, size);
+		decoder.decodeFrame();
+		frame = unpacker.getCompressedFrame(&size);
+	}
 	return 0;
 }

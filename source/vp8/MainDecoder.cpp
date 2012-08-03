@@ -63,8 +63,7 @@ void MainDecoder::setFrameData(const void* data, size_t size) {
 	frameData = data;
 	frameSize = size;
 
-	decodeFrameTag(data);
-	int tagSize = context.keyFrame ? 10 : 3;
+	int tagSize = decodeFrameTag(data);
 	source.reload((const char*)data + tagSize, size - tagSize);
 }
 
@@ -83,16 +82,28 @@ void MainDecoder::decodeFrameHeader() {
 		RAISE(FeatureIncomplete, "Partitioning isn't supported");
 	}
 	decodeQuantizerTable();
+
 	if (context.keyFrame) {
 		context.refreshProbability = source.uint<1>();
 	} else {
-		// TODO: Complete this branch
+		uint8_t refreshGoldenFrame = source.uint<1>();
+		uint8_t refreshAlternateFrame = source.uint<1>();
+		if (!refreshGoldenFrame) {
+			source.uint<2>();
+		}
+		if (!refreshAlternateFrame) {
+			source.uint<2>();
+		}
+		source.uint<1>(); source.uint<1>();
+		source.uint<1>(); source.uint<1>();
 	}
-	probabilityManager.loadCoeff(&source);
+
+	probabilityManager.loadCoeffProb(&source);
 	context.skipping.enabled = source.uint<1>();
 	if (context.skipping.enabled) {
 		context.skipping.probability = source.uint<8>();
 	}
+
 	if (!context.keyFrame) {
 		// TODO: Complete this branch
 	}
@@ -142,7 +153,7 @@ void MainDecoder::decodeSubmode(BlockInfo* info) {
 	}
 }
 
-void MainDecoder::decodeFrameTag(const void* data) {
+int MainDecoder::decodeFrameTag(const void* data) {
 	const uint8_t* cursor = (const uint8_t*)data;
 	uint32_t raw = cursor[0] | ((uint32_t)cursor[1] << 8)
 			| ((uint32_t)cursor[2] << 16);
@@ -166,7 +177,9 @@ void MainDecoder::decodeFrameTag(const void* data) {
 				|| height != geometry.displayHeight) {
 			resizeFrame(width, height);
 		}
+		return 10;
 	}
+	return 3;
 }
 
 void MainDecoder::decodeBlockCoeff(short coefficient[25][16],
